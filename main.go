@@ -1,0 +1,530 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"regexp"
+	"strings"
+	"syscall"
+	"time"
+)
+
+const (
+	defaultListenAddr    = ":8080"
+	defaultOpenSearchURL = "https://localhost:9200"
+	defaultUsername      = "admin"
+	defaultPassword      = "Cedar7!FluxOrbit29"
+
+	ismPolicyID       = "generic-rollover-100m"
+	indexTemplateName = "gateway-rollover-template"
+	rolloverSuffix    = "-rollover"
+	backingIndexSeed  = "-000001"
+
+	maxIndexNameBytes = 255
+)
+
+var (
+	indexNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+	errRouteNotFound = errors.New("route not found")
+)
+
+type Config struct {
+	BaseURL    string
+	Username   string
+	Password   string
+	ListenAddr string
+	Shards     int
+	Replicas   int
+	HTTPClient *http.Client
+}
+
+type Client struct {
+	cfg Config
+}
+
+type Gateway struct {
+	client *Client
+}
+
+type ResponseError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string
+}
+
+func (e *ResponseError) Error() string {
+	return fmt.Sprintf("%s %s failed: status=%d body=%s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+type ingestResponse struct {
+	Result       string `json:"result"`
+	WriteAlias   string `json:"write_alias"`
+	DocumentID   string `json:"document_id"`
+	Bootstrapped bool   `json:"bootstrapped"`
+}
+
+type indexDocumentResponse struct {
+	ID     string `json:"_id"`
+	Result string `json:"result"`
+}
+
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg := Config{
+		BaseURL:    getenv("OPENSEARCH_URL", defaultOpenSearchURL),
+		Username:   getenv("OPENSEARCH_USERNAME", defaultUsername),
+		Password:   getenv("OPENSEARCH_PASSWORD", defaultPassword),
+		ListenAddr: getenv("LISTEN_ADDR", defaultListenAddr),
+		Shards:     2,
+		Replicas:   2,
+		HTTPClient: defaultHTTPClient(),
+	}
+
+	if err := run(ctx, cfg, func(handler http.Handler) error {
+		srv := &http.Server{
+			Addr:              cfg.ListenAddr,
+			Handler:           handler,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+
+		err := srv.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}); err != nil {
+		fatal(err)
+	}
+}
+
+func run(ctx context.Context, cfg Config, serve func(http.Handler) error) error {
+	client := &Client{cfg: cfg}
+
+	if err := client.EnsureISMPolicy(ctx, ismPolicyID, 100000000); err != nil {
+		return err
+	}
+
+	if err := client.EnsureIndexTemplate(ctx, indexTemplateName); err != nil {
+		return err
+	}
+
+	return serve(&Gateway{client: client})
+}
+
+func defaultHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // local/dev only
+		},
+	}
+}
+
+func (c *Client) EnsureISMPolicy(ctx context.Context, policyID string, minDocCount int) error {
+	body := map[string]any{
+		"policy": map[string]any{
+			"description":   "Generic rollover at 100M docs",
+			"default_state": "hot",
+			"states": []map[string]any{
+				{
+					"name": "hot",
+					"actions": []map[string]any{
+						{
+							"rollover": map[string]any{
+								"min_doc_count": minDocCount,
+							},
+						},
+					},
+					"transitions": []any{},
+				},
+			},
+		},
+	}
+
+	return c.doJSON(ctx, http.MethodPut, "/_plugins/_ism/policies/"+url.PathEscape(policyID), body, nil, []int{200, 201})
+}
+
+func (c *Client) EnsureIndexTemplate(ctx context.Context, templateName string) error {
+	body := map[string]any{
+		"index_patterns": []string{"*-*-rollover-*"},
+		"priority":       100,
+		"template": map[string]any{
+			"settings": map[string]any{
+				"index.number_of_shards":   c.cfg.Shards,
+				"index.number_of_replicas": c.cfg.Replicas,
+			},
+			"mappings": map[string]any{
+				"properties": map[string]any{
+					"event_time": map[string]any{
+						"type": "date",
+					},
+				},
+			},
+		},
+	}
+
+	return c.doJSON(ctx, http.MethodPut, "/_index_template/"+url.PathEscape(templateName), body, nil, []int{200, 201})
+}
+
+func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	indexName, err := parseIngestPath(r.URL.Path)
+	if err != nil {
+		if errors.Is(err, errRouteNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		writeErrorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		writeErrorJSON(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		return
+	}
+
+	document, err := decodeJSONObject(r.Body)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	eventTime, err := parseEventTime(document)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeAlias := buildWriteAlias(indexName, eventTime)
+	firstIndex := buildFirstBackingIndex(writeAlias)
+	if len(writeAlias) > maxIndexNameBytes || len(firstIndex) > maxIndexNameBytes {
+		writeErrorJSON(w, http.StatusBadRequest, "generated alias or backing index name exceeds OpenSearch limits")
+		return
+	}
+
+	document["event_time"] = eventTime.UTC().Format(time.RFC3339)
+
+	bootstrapped, err := g.client.ensureWriteAlias(r.Context(), writeAlias)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadGateway, fmt.Sprintf("OpenSearch bootstrap failed: %v", err))
+		return
+	}
+
+	indexed, err := g.client.IndexDocument(r.Context(), writeAlias, document)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadGateway, fmt.Sprintf("OpenSearch ingest failed: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, ingestResponse{
+		Result:       indexed.Result,
+		WriteAlias:   writeAlias,
+		DocumentID:   indexed.ID,
+		Bootstrapped: bootstrapped,
+	})
+}
+
+func parseIngestPath(path string) (string, error) {
+	if !strings.HasPrefix(path, "/ingest/") {
+		return "", errRouteNotFound
+	}
+
+	indexName := strings.TrimPrefix(path, "/ingest/")
+	indexName = strings.TrimSuffix(indexName, "/")
+	if indexName == "" {
+		return "", errors.New("path must be /ingest/<index>/")
+	}
+	if strings.Contains(indexName, "/") {
+		return "", errors.New("path must be /ingest/<index>/")
+	}
+	if !indexNamePattern.MatchString(indexName) {
+		return "", errors.New("index name must start with a lowercase letter or digit and contain only lowercase letters, digits, '-' or '_'")
+	}
+	return indexName, nil
+}
+
+func decodeJSONObject(body io.Reader) (map[string]any, error) {
+	decoder := json.NewDecoder(body)
+
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("request body must be a JSON object")
+		}
+		return nil, fmt.Errorf("invalid JSON body: %w", err)
+	}
+
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, errors.New("request body must be a JSON object")
+	}
+
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("request body must contain a single JSON object")
+		}
+		return nil, fmt.Errorf("invalid JSON body: %w", err)
+	}
+
+	return object, nil
+}
+
+func parseEventTime(document map[string]any) (time.Time, error) {
+	rawValue, ok := document["event_time"]
+	if !ok {
+		return time.Time{}, errors.New(`missing required field "event_time"`)
+	}
+
+	value, ok := rawValue.(string)
+	if !ok {
+		return time.Time{}, errors.New(`field "event_time" must be a string`)
+	}
+	if !strings.HasSuffix(value, "Z") {
+		return time.Time{}, errors.New(`field "event_time" must be a UTC RFC3339 timestamp ending in "Z"`)
+	}
+
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, errors.New(`field "event_time" must be a valid RFC3339 timestamp`)
+	}
+	return parsed.UTC(), nil
+}
+
+func buildWriteAlias(indexName string, eventTime time.Time) string {
+	return fmt.Sprintf("%s-%s%s", indexName, eventTime.UTC().Format("20060102"), rolloverSuffix)
+}
+
+func buildFirstBackingIndex(alias string) string {
+	return alias + backingIndexSeed
+}
+
+func (c *Client) ensureWriteAlias(ctx context.Context, alias string) (bool, error) {
+	exists, err := c.aliasExists(ctx, alias)
+	if err != nil {
+		return false, fmt.Errorf("check alias %q: %w", alias, err)
+	}
+	if exists {
+		return false, nil
+	}
+
+	firstIndex := buildFirstBackingIndex(alias)
+	if err := c.bootstrapDateStream(ctx, firstIndex, alias); err != nil {
+		if isRetryableBootstrapConflict(err) {
+			exists, recheckErr := c.aliasExists(ctx, alias)
+			if recheckErr != nil {
+				return false, fmt.Errorf("re-check alias %q after bootstrap conflict: %w", alias, recheckErr)
+			}
+			if exists {
+				return false, nil
+			}
+		}
+		return false, fmt.Errorf("bootstrap %q: %w", alias, err)
+	}
+
+	if err := c.attachISMPolicy(ctx, firstIndex, ismPolicyID); err != nil {
+		return false, fmt.Errorf("attach ISM policy to %q: %w", firstIndex, err)
+	}
+
+	return true, nil
+}
+
+func (c *Client) IndexDocument(ctx context.Context, alias string, document map[string]any) (indexDocumentResponse, error) {
+	path := "/" + url.PathEscape(alias) + "/_doc"
+
+	var response indexDocumentResponse
+	if err := c.doJSON(ctx, http.MethodPost, path, document, &response, []int{200, 201}); err != nil {
+		return indexDocumentResponse{}, err
+	}
+	return response, nil
+}
+
+func (c *Client) bootstrapDateStream(ctx context.Context, indexName, alias string) error {
+	body := map[string]any{
+		"aliases": map[string]any{
+			alias: map[string]any{
+				"is_write_index": true,
+			},
+		},
+		"settings": map[string]any{
+			"plugins.index_state_management.rollover_alias": alias,
+		},
+	}
+
+	return c.doJSON(ctx, http.MethodPut, "/"+url.PathEscape(indexName), body, nil, []int{200, 201})
+}
+
+func (c *Client) attachISMPolicy(ctx context.Context, indexName, policyID string) error {
+	body := map[string]any{
+		"policy_id": policyID,
+	}
+
+	path := "/_plugins/_ism/add/" + url.PathEscape(indexName)
+	return c.doJSON(ctx, http.MethodPost, path, body, nil, []int{200, 201})
+}
+
+func (c *Client) aliasExists(ctx context.Context, alias string) (bool, error) {
+	req, err := c.newRequest(ctx, http.MethodHead, "/_alias/"+url.PathEscape(alias), nil)
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := c.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		b, _ := io.ReadAll(resp.Body)
+		return false, &ResponseError{
+			Method:     http.MethodHead,
+			Path:       "/_alias/" + url.PathEscape(alias),
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(b)),
+		}
+	}
+}
+
+func (c *Client) doJSON(ctx context.Context, method, path string, body any, out any, okStatuses []int) error {
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(b)
+	}
+
+	req, err := c.newRequest(ctx, method, path, reader)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if !containsStatus(okStatuses, resp.StatusCode) {
+		b, _ := io.ReadAll(resp.Body)
+		return &ResponseError{
+			Method:     method,
+			Path:       path,
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(b)),
+		}
+	}
+
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
+	base := strings.TrimRight(c.cfg.BaseURL, "/")
+	req, err := http.NewRequestWithContext(ctx, method, base+path, body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.SetBasicAuth(c.cfg.Username, c.cfg.Password)
+	req.Header.Set("Accept", "application/json")
+	return req, nil
+}
+
+func isRetryableBootstrapConflict(err error) bool {
+	var responseErr *ResponseError
+	if !errors.As(err, &responseErr) {
+		return false
+	}
+	if responseErr.StatusCode != http.StatusBadRequest && responseErr.StatusCode != http.StatusConflict {
+		return false
+	}
+
+	body := responseErr.Body
+	return strings.Contains(body, "resource_already_exists_exception") || strings.Contains(body, "already exists")
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func writeErrorJSON(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, errorResponse{Error: message})
+}
+
+func containsStatus(ok []int, code int) bool {
+	for _, s := range ok {
+		if s == code {
+			return true
+		}
+	}
+	return false
+}
+
+func getenv(key, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func fatal(err error) {
+	if err == nil {
+		return
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		fmt.Fprintf(os.Stderr, "network error: %v\n", urlErr)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	os.Exit(1)
+}
