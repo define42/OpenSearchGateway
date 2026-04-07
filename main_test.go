@@ -21,12 +21,15 @@ func TestRunBootstrapsBeforeServe(t *testing.T) {
 	var templateBody map[string]any
 
 	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/_plugins/_ism/policies/" + ismPolicyID:
+		switch r.Method + " " + r.URL.Path {
+		case "GET /_plugins/_ism/policies/" + ismPolicyID:
 			calls = append(calls, "policy")
+			http.NotFound(w, r)
+		case "PUT /_plugins/_ism/policies/" + ismPolicyID:
+			calls = append(calls, "policy-put")
 			policyBody = decodeRequestBody(t, r)
 			w.WriteHeader(http.StatusCreated)
-		case "/_index_template/" + indexTemplateName:
+		case "PUT /_index_template/" + indexTemplateName:
 			calls = append(calls, "template")
 			templateBody = decodeRequestBody(t, r)
 			w.WriteHeader(http.StatusCreated)
@@ -41,7 +44,7 @@ func TestRunBootstrapsBeforeServe(t *testing.T) {
 		if handler == nil {
 			t.Fatal("expected handler to be constructed")
 		}
-		if !reflect.DeepEqual(calls, []string{"policy", "template"}) {
+		if !reflect.DeepEqual(calls, []string{"policy", "policy-put", "template"}) {
 			t.Fatalf("unexpected bootstrap order: %#v", calls)
 		}
 
@@ -68,6 +71,90 @@ func TestRunBootstrapsBeforeServe(t *testing.T) {
 	})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("expected sentinel error, got %v", err)
+	}
+}
+
+func TestEnsureISMPolicySkipsWhenExistingMatches(t *testing.T) {
+	t.Parallel()
+
+	var calls []string
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+
+		if r.Method != http.MethodGet || r.URL.Path != "/_plugins/_ism/policies/"+ismPolicyID {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ismPolicyResponse{
+			SeqNo:       7,
+			PrimaryTerm: 1,
+			Policy:      buildISMPolicy(100000000),
+		})
+	}))
+	defer openSearch.Close()
+
+	client := &Client{cfg: testConfig(openSearch)}
+	if err := client.EnsureISMPolicy(context.Background(), ismPolicyID, 100000000); err != nil {
+		t.Fatalf("EnsureISMPolicy returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(calls, []string{"GET /_plugins/_ism/policies/" + ismPolicyID}) {
+		t.Fatalf("unexpected request sequence: %#v", calls)
+	}
+}
+
+func TestEnsureISMPolicyUpdatesWhenExistingDiffers(t *testing.T) {
+	t.Parallel()
+
+	var calls []string
+	var updateBody map[string]any
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+
+		switch len(calls) {
+		case 1:
+			if r.Method != http.MethodGet || r.URL.Path != "/_plugins/_ism/policies/"+ismPolicyID {
+				t.Fatalf("unexpected first request: %s %s", r.Method, r.URL.RequestURI())
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ismPolicyResponse{
+				SeqNo:       11,
+				PrimaryTerm: 2,
+				Policy:      buildISMPolicy(10),
+			})
+		case 2:
+			expectedPath := "/_plugins/_ism/policies/" + ismPolicyID + "?if_seq_no=11&if_primary_term=2"
+			if r.Method != http.MethodPut || r.URL.RequestURI() != expectedPath {
+				t.Fatalf("unexpected second request: %s %s", r.Method, r.URL.RequestURI())
+			}
+			updateBody = decodeRequestBody(t, r)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Fatalf("unexpected extra request: %s %s", r.Method, r.URL.RequestURI())
+		}
+	}))
+	defer openSearch.Close()
+
+	client := &Client{cfg: testConfig(openSearch)}
+	if err := client.EnsureISMPolicy(context.Background(), ismPolicyID, 100000000); err != nil {
+		t.Fatalf("EnsureISMPolicy returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(calls, []string{
+		"GET /_plugins/_ism/policies/" + ismPolicyID,
+		"PUT /_plugins/_ism/policies/" + ismPolicyID + "?if_seq_no=11&if_primary_term=2",
+	}) {
+		t.Fatalf("unexpected request sequence: %#v", calls)
+	}
+
+	policy := nestedMap(t, updateBody["policy"])
+	states, ok := policy["states"].([]any)
+	if !ok || len(states) != 1 {
+		t.Fatalf("unexpected updated policy body: %#v", updateBody)
 	}
 }
 

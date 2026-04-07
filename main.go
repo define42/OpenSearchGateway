@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"regexp"
 	"strings"
 	"syscall"
@@ -65,6 +66,41 @@ type ResponseError struct {
 
 func (e *ResponseError) Error() string {
 	return fmt.Sprintf("%s %s failed: status=%d body=%s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+type ismPolicyRequest struct {
+	Policy ismPolicy `json:"policy"`
+}
+
+type ismPolicyResponse struct {
+	SeqNo       int64     `json:"_seq_no"`
+	PrimaryTerm int64     `json:"_primary_term"`
+	Policy      ismPolicy `json:"policy"`
+}
+
+type ismPolicy struct {
+	Description  string     `json:"description"`
+	DefaultState string     `json:"default_state"`
+	States       []ismState `json:"states"`
+}
+
+type ismState struct {
+	Name        string          `json:"name"`
+	Actions     []ismAction     `json:"actions"`
+	Transitions []ismTransition `json:"transitions"`
+}
+
+type ismAction struct {
+	Rollover *ismRolloverAction `json:"rollover,omitempty"`
+}
+
+type ismRolloverAction struct {
+	MinDocCount int `json:"min_doc_count,omitempty"`
+}
+
+type ismTransition struct {
+	StateName  string         `json:"state_name,omitempty"`
+	Conditions map[string]any `json:"conditions,omitempty"`
 }
 
 type ingestResponse struct {
@@ -145,27 +181,26 @@ func defaultHTTPClient() *http.Client {
 }
 
 func (c *Client) EnsureISMPolicy(ctx context.Context, policyID string, minDocCount int) error {
-	body := map[string]any{
-		"policy": map[string]any{
-			"description":   "Generic rollover at 100M docs",
-			"default_state": "hot",
-			"states": []map[string]any{
-				{
-					"name": "hot",
-					"actions": []map[string]any{
-						{
-							"rollover": map[string]any{
-								"min_doc_count": minDocCount,
-							},
-						},
-					},
-					"transitions": []any{},
-				},
-			},
-		},
+	path := "/_plugins/_ism/policies/" + url.PathEscape(policyID)
+	desired := ismPolicyRequest{
+		Policy: buildISMPolicy(minDocCount),
 	}
 
-	return c.doJSON(ctx, http.MethodPut, "/_plugins/_ism/policies/"+url.PathEscape(policyID), body, nil, []int{200, 201})
+	var existing ismPolicyResponse
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &existing, []int{http.StatusOK})
+	if err != nil {
+		if isNotFoundResponse(err) {
+			return c.doJSON(ctx, http.MethodPut, path, desired, nil, []int{http.StatusOK, http.StatusCreated})
+		}
+		return err
+	}
+
+	if reflect.DeepEqual(existing.Policy, desired.Policy) {
+		return nil
+	}
+
+	updatePath := fmt.Sprintf("%s?if_seq_no=%d&if_primary_term=%d", path, existing.SeqNo, existing.PrimaryTerm)
+	return c.doJSON(ctx, http.MethodPut, updatePath, desired, nil, []int{http.StatusOK, http.StatusCreated})
 }
 
 func (c *Client) EnsureIndexTemplate(ctx context.Context, templateName string) error {
@@ -485,6 +520,31 @@ func isRetryableBootstrapConflict(err error) bool {
 
 	body := responseErr.Body
 	return strings.Contains(body, "resource_already_exists_exception") || strings.Contains(body, "already exists")
+}
+
+func isNotFoundResponse(err error) bool {
+	var responseErr *ResponseError
+	return errors.As(err, &responseErr) && responseErr.StatusCode == http.StatusNotFound
+}
+
+func buildISMPolicy(minDocCount int) ismPolicy {
+	return ismPolicy{
+		Description:  "Generic rollover at 100M docs",
+		DefaultState: "hot",
+		States: []ismState{
+			{
+				Name: "hot",
+				Actions: []ismAction{
+					{
+						Rollover: &ismRolloverAction{
+							MinDocCount: minDocCount,
+						},
+					},
+				},
+				Transitions: []ismTransition{},
+			},
+		},
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
