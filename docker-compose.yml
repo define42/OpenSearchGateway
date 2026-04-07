@@ -64,6 +64,10 @@ services:
       OPENSEARCH_URL: https://opensearch:9200
       OPENSEARCH_USERNAME: admin
       OPENSEARCH_PASSWORD: ${OPENSEARCH_ADMIN_PASSWORD:-Cedar7!FluxOrbit29}
+      DASHBOARDS_URL: http://opensearch-dashboards:5601
+      DASHBOARDS_USERNAME: admin
+      DASHBOARDS_PASSWORD: ${OPENSEARCH_ADMIN_PASSWORD:-Cedar7!FluxOrbit29}
+      DASHBOARDS_TENANT: admin_tenant
       LISTEN_ADDR: :8080
     ports:
       - "8080:8080"

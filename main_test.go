@@ -158,6 +158,112 @@ func TestEnsureISMPolicyUpdatesWhenExistingDiffers(t *testing.T) {
 	}
 }
 
+func TestEnsureDashboardDataViewCreatesExpectedPattern(t *testing.T) {
+	t.Parallel()
+
+	var calls []string
+	var requestBody map[string]any
+	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+
+		expectedPath := "/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true"
+		if r.Method != http.MethodPost || r.URL.RequestURI() != expectedPath {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
+		}
+		if got := r.Header.Get("osd-xsrf"); got != "true" {
+			t.Fatalf("expected osd-xsrf header, got %q", got)
+		}
+		if got := r.Header.Get("securitytenant"); got != "admin_tenant" {
+			t.Fatalf("expected securitytenant header, got %q", got)
+		}
+
+		requestBody = decodeRequestBody(t, r)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer dashboards.Close()
+
+	client := &Client{cfg: Config{
+		DashboardsURL:      dashboards.URL,
+		DashboardsUsername: "admin",
+		DashboardsPassword: "Admin123!",
+		DashboardsTenant:   "admin_tenant",
+		HTTPClient:         dashboards.Client(),
+	}}
+
+	if err := client.EnsureDashboardDataView(context.Background(), "orders"); err != nil {
+		t.Fatalf("EnsureDashboardDataView returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(calls, []string{
+		"POST /api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true",
+	}) {
+		t.Fatalf("unexpected request sequence: %#v", calls)
+	}
+
+	attributes := nestedMap(t, requestBody["attributes"])
+	if got := attributes["title"]; got != "orders-*" {
+		t.Fatalf("unexpected data view title: %#v", got)
+	}
+	if got := attributes["timeFieldName"]; got != "event_time" {
+		t.Fatalf("unexpected time field: %#v", got)
+	}
+}
+
+func TestGatewayIngestEnsuresDashboardDataView(t *testing.T) {
+	t.Parallel()
+
+	var openSearchCalls []string
+	var dashboardsCalls []string
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openSearchCalls = append(openSearchCalls, r.Method+" "+r.URL.Path)
+
+		switch r.Method + " " + r.URL.Path {
+		case "HEAD /_alias/orders-20241230-rollover":
+			w.WriteHeader(http.StatusOK)
+		case "POST /orders-20241230-rollover/_doc":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"result":"created","_id":"dash-view"}`)
+		default:
+			t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer openSearch.Close()
+
+	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dashboardsCalls = append(dashboardsCalls, r.Method+" "+r.URL.RequestURI())
+
+		if r.Method != http.MethodPost || r.URL.RequestURI() != "/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true" {
+			t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.RequestURI())
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer dashboards.Close()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/ingest/orders", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+
+	(&Gateway{client: &Client{cfg: testConfigWithDashboards(openSearch, dashboards)}}).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !reflect.DeepEqual(openSearchCalls, []string{
+		"HEAD /_alias/orders-20241230-rollover",
+		"POST /orders-20241230-rollover/_doc",
+	}) {
+		t.Fatalf("unexpected OpenSearch calls: %#v", openSearchCalls)
+	}
+	if !reflect.DeepEqual(dashboardsCalls, []string{
+		"POST /api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true",
+	}) {
+		t.Fatalf("unexpected Dashboards calls: %#v", dashboardsCalls)
+	}
+}
+
 func TestGatewayRootServesDemoForm(t *testing.T) {
 	t.Parallel()
 
@@ -535,14 +641,24 @@ func sequenceHandler(t *testing.T, responses ...responseSpec) http.HandlerFunc {
 
 func testConfig(server *httptest.Server) Config {
 	return Config{
-		BaseURL:    server.URL,
-		Username:   "admin",
-		Password:   "Admin123!",
-		ListenAddr: ":0",
-		Shards:     2,
-		Replicas:   2,
-		HTTPClient: server.Client(),
+		BaseURL:            server.URL,
+		Username:           "admin",
+		Password:           "Admin123!",
+		DashboardsUsername: "admin",
+		DashboardsPassword: "Admin123!",
+		DashboardsTenant:   "admin_tenant",
+		ListenAddr:         ":0",
+		Shards:             2,
+		Replicas:           2,
+		HTTPClient:         server.Client(),
 	}
+}
+
+func testConfigWithDashboards(openSearch, dashboards *httptest.Server) Config {
+	cfg := testConfig(openSearch)
+	cfg.DashboardsURL = dashboards.URL
+	cfg.HTTPClient = openSearch.Client()
+	return cfg
 }
 
 func decodeRequestBody(t *testing.T, r *http.Request) map[string]any {

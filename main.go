@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -23,8 +24,10 @@ import (
 const (
 	defaultListenAddr    = ":8080"
 	defaultOpenSearchURL = "https://localhost:9200"
+	defaultDashboardsURL = "http://localhost:5601"
 	defaultUsername      = "admin"
 	defaultPassword      = "Cedar7!FluxOrbit29"
+	defaultTenant        = "admin_tenant"
 
 	ismPolicyID       = "generic-rollover-100m"
 	indexTemplateName = "gateway-rollover-template"
@@ -40,17 +43,22 @@ var (
 )
 
 type Config struct {
-	BaseURL    string
-	Username   string
-	Password   string
-	ListenAddr string
-	Shards     int
-	Replicas   int
-	HTTPClient *http.Client
+	BaseURL            string
+	Username           string
+	Password           string
+	DashboardsURL      string
+	DashboardsUsername string
+	DashboardsPassword string
+	DashboardsTenant   string
+	ListenAddr         string
+	Shards             int
+	Replicas           int
+	HTTPClient         *http.Client
 }
 
 type Client struct {
-	cfg Config
+	cfg              Config
+	ensuredDataViews sync.Map
 }
 
 type Gateway struct {
@@ -117,6 +125,15 @@ type indexDocumentResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+type dashboardsSavedObjectRequest struct {
+	Attributes dashboardsDataViewAttributes `json:"attributes"`
+}
+
+type dashboardsDataViewAttributes struct {
+	Title         string `json:"title"`
+	TimeFieldName string `json:"timeFieldName"`
 }
 
 const demoPageHTML = `<!DOCTYPE html>
@@ -364,13 +381,17 @@ func main() {
 	defer stop()
 
 	cfg := Config{
-		BaseURL:    getenv("OPENSEARCH_URL", defaultOpenSearchURL),
-		Username:   getenv("OPENSEARCH_USERNAME", defaultUsername),
-		Password:   getenv("OPENSEARCH_PASSWORD", defaultPassword),
-		ListenAddr: getenv("LISTEN_ADDR", defaultListenAddr),
-		Shards:     2,
-		Replicas:   2,
-		HTTPClient: defaultHTTPClient(),
+		BaseURL:            getenv("OPENSEARCH_URL", defaultOpenSearchURL),
+		Username:           getenv("OPENSEARCH_USERNAME", defaultUsername),
+		Password:           getenv("OPENSEARCH_PASSWORD", defaultPassword),
+		DashboardsURL:      getenv("DASHBOARDS_URL", defaultDashboardsURL),
+		DashboardsUsername: getenv("DASHBOARDS_USERNAME", getenv("OPENSEARCH_USERNAME", defaultUsername)),
+		DashboardsPassword: getenv("DASHBOARDS_PASSWORD", getenv("OPENSEARCH_PASSWORD", defaultPassword)),
+		DashboardsTenant:   getenv("DASHBOARDS_TENANT", defaultTenant),
+		ListenAddr:         getenv("LISTEN_ADDR", defaultListenAddr),
+		Shards:             2,
+		Replicas:           2,
+		HTTPClient:         defaultHTTPClient(),
 	}
 
 	if err := run(ctx, cfg, func(handler http.Handler) error {
@@ -531,6 +552,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := g.client.EnsureDashboardDataView(r.Context(), indexName); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ensure Dashboards data view for %q failed: %v\n", buildDataViewPattern(indexName), err)
+	}
+
 	writeJSON(w, http.StatusCreated, ingestResponse{
 		Result:       indexed.Result,
 		WriteAlias:   writeAlias,
@@ -654,6 +679,32 @@ func (c *Client) IndexDocument(ctx context.Context, alias string, document map[s
 	return response, nil
 }
 
+func (c *Client) EnsureDashboardDataView(ctx context.Context, indexName string) error {
+	if c.cfg.DashboardsURL == "" {
+		return nil
+	}
+
+	dataViewID := buildDataViewID(indexName)
+	if _, ok := c.ensuredDataViews.Load(dataViewID); ok {
+		return nil
+	}
+
+	body := dashboardsSavedObjectRequest{
+		Attributes: dashboardsDataViewAttributes{
+			Title:         buildDataViewPattern(indexName),
+			TimeFieldName: "event_time",
+		},
+	}
+
+	path := "/api/saved_objects/index-pattern/" + url.PathEscape(dataViewID) + "?overwrite=true"
+	if err := c.doDashboardsJSON(ctx, http.MethodPost, path, body, nil, []int{http.StatusOK, http.StatusCreated}); err != nil {
+		return err
+	}
+
+	c.ensuredDataViews.Store(dataViewID, true)
+	return nil
+}
+
 func (c *Client) bootstrapDateStream(ctx context.Context, indexName, alias string) error {
 	body := map[string]any{
 		"aliases": map[string]any{
@@ -707,6 +758,14 @@ func (c *Client) aliasExists(ctx context.Context, alias string) (bool, error) {
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body any, out any, okStatuses []int) error {
+	return c.doJSONWithRequest(ctx, method, path, body, out, okStatuses, c.newRequest)
+}
+
+func (c *Client) doDashboardsJSON(ctx context.Context, method, path string, body any, out any, okStatuses []int) error {
+	return c.doJSONWithRequest(ctx, method, path, body, out, okStatuses, c.newDashboardsRequest)
+}
+
+func (c *Client) doJSONWithRequest(ctx context.Context, method, path string, body any, out any, okStatuses []int, buildRequest func(context.Context, string, string, io.Reader) (*http.Request, error)) error {
 	var reader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -716,7 +775,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, out 
 		reader = bytes.NewReader(b)
 	}
 
-	req, err := c.newRequest(ctx, method, path, reader)
+	req, err := buildRequest(ctx, method, path, reader)
 	if err != nil {
 		return err
 	}
@@ -748,14 +807,34 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, out 
 }
 
 func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	base := strings.TrimRight(c.cfg.BaseURL, "/")
+	return c.newRequestForBase(ctx, c.cfg.BaseURL, method, path, body, c.cfg.Username, c.cfg.Password, nil)
+}
+
+func (c *Client) newDashboardsRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
+	headers := map[string]string{
+		"osd-xsrf": "true",
+	}
+	if c.cfg.DashboardsTenant != "" {
+		headers["securitytenant"] = c.cfg.DashboardsTenant
+	}
+
+	return c.newRequestForBase(ctx, c.cfg.DashboardsURL, method, path, body, c.cfg.DashboardsUsername, c.cfg.DashboardsPassword, headers)
+}
+
+func (c *Client) newRequestForBase(ctx context.Context, baseURL, method, path string, body io.Reader, username, password string, headers map[string]string) (*http.Request, error) {
+	base := strings.TrimRight(baseURL, "/")
 	req, err := http.NewRequestWithContext(ctx, method, base+path, body)
 	if err != nil {
 		return nil, err
 	}
 
-	req.SetBasicAuth(c.cfg.Username, c.cfg.Password)
+	if username != "" || password != "" {
+		req.SetBasicAuth(username, password)
+	}
 	req.Header.Set("Accept", "application/json")
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 	return req, nil
 }
 
@@ -795,6 +874,14 @@ func buildISMPolicy(minDocCount int) ismPolicy {
 			},
 		},
 	}
+}
+
+func buildDataViewID(indexName string) string {
+	return "gateway-index-pattern-" + indexName
+}
+
+func buildDataViewPattern(indexName string) string {
+	return indexName + "-*"
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
