@@ -434,7 +434,7 @@ func run(ctx context.Context, cfg Config, serve func(http.Handler) error) error 
 		return err
 	}
 
-	return serve(&Gateway{client: client})
+	return serve((&Gateway{client: client}).Handler())
 }
 
 func defaultHTTPClient() *http.Client {
@@ -491,17 +491,30 @@ func (c *Client) EnsureIndexTemplate(ctx context.Context, templateName string) e
 	return c.doJSON(ctx, http.MethodPut, "/_index_template/"+url.PathEscape(templateName), body, nil, []int{200, 201})
 }
 
-func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/" {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		serveDemoPage(w)
+func (g *Gateway) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/demo", g.handleDemo)
+	mux.HandleFunc("/ingest", g.handleIngest)
+	mux.HandleFunc("/ingest/", g.handleIngest)
+	return mux
+}
+
+func (g *Gateway) handleDemo(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/demo" {
+		http.NotFound(w, r)
 		return
 	}
 
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	serveDemoPage(w)
+}
+
+func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	indexName, err := parseIngestPath(r.URL.Path)
 	if err != nil {
 		if errors.Is(err, errRouteNotFound) {

@@ -64,7 +64,7 @@ It is especially handy for internal tools, demos, prototypes, and ingestion pipe
 
 ## HTTP Interface
 
-### `GET /`
+### `GET /demo`
 
 Serves a small demo page where you can:
 

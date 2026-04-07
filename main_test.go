@@ -356,7 +356,7 @@ func TestGatewayIngestEnsuresDashboardDataView(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/ingest/orders", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"hello"}`))
 	request.Header.Set("Content-Type", "application/json")
 
-	(&Gateway{client: &Client{cfg: testConfigWithDashboards(openSearch, dashboards)}}).ServeHTTP(recorder, request)
+	testGatewayHandler(testConfigWithDashboards(openSearch, dashboards)).ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("expected status 201, got %d: %s", recorder.Code, recorder.Body.String())
@@ -371,12 +371,12 @@ func TestGatewayIngestEnsuresDashboardDataView(t *testing.T) {
 	}
 }
 
-func TestGatewayRootServesDemoForm(t *testing.T) {
+func TestGatewayDemoServesDemoForm(t *testing.T) {
 	t.Parallel()
 
-	gateway := &Gateway{client: &Client{cfg: Config{}}}
+	gateway := (&Gateway{client: &Client{cfg: Config{}}}).Handler()
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request := httptest.NewRequest(http.MethodGet, "/demo", nil)
 
 	gateway.ServeHTTP(recorder, request)
 
@@ -395,12 +395,12 @@ func TestGatewayRootServesDemoForm(t *testing.T) {
 	}
 }
 
-func TestGatewayRootRejectsNonGet(t *testing.T) {
+func TestGatewayDemoRejectsNonGet(t *testing.T) {
 	t.Parallel()
 
-	gateway := &Gateway{client: &Client{cfg: Config{}}}
+	gateway := (&Gateway{client: &Client{cfg: Config{}}}).Handler()
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/", nil)
+	request := httptest.NewRequest(http.MethodPost, "/demo", nil)
 
 	gateway.ServeHTTP(recorder, request)
 
@@ -409,6 +409,34 @@ func TestGatewayRootRejectsNonGet(t *testing.T) {
 	}
 	if got := recorder.Header().Get("Allow"); got != http.MethodGet {
 		t.Fatalf("expected Allow header %q, got %q", http.MethodGet, got)
+	}
+}
+
+func TestGatewayRootReturnsNotFound(t *testing.T) {
+	t.Parallel()
+
+	gateway := (&Gateway{client: &Client{cfg: Config{}}}).Handler()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", recorder.Code)
+	}
+}
+
+func TestGatewayIngestBasePathReturnsNotFound(t *testing.T) {
+	t.Parallel()
+
+	gateway := (&Gateway{client: &Client{cfg: Config{}}}).Handler()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/ingest", nil)
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", recorder.Code)
 	}
 }
 
@@ -450,7 +478,7 @@ func TestGatewayIngestBootstrapsAndIndexes(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/ingest/orders/", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"hello","count":1}`))
 	request.Header.Set("Content-Type", "application/json")
 
-	(&Gateway{client: &Client{cfg: testConfig(openSearch)}}).ServeHTTP(recorder, request)
+	testGatewayHandler(testConfig(openSearch)).ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("expected status 201, got %d: %s", recorder.Code, recorder.Body.String())
@@ -513,7 +541,7 @@ func TestGatewayRepeatWriteSkipsBootstrap(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/ingest/orders", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"hello"}`))
 	request.Header.Set("Content-Type", "application/json")
 
-	(&Gateway{client: &Client{cfg: testConfig(openSearch)}}).ServeHTTP(recorder, request)
+	testGatewayHandler(testConfig(openSearch)).ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("expected status 201, got %d: %s", recorder.Code, recorder.Body.String())
@@ -563,7 +591,7 @@ func TestGatewayValidationErrors(t *testing.T) {
 		{name: "name too long", method: http.MethodPost, path: "/ingest/" + longIndexName, contentType: "application/json", body: `{"event_time":"2024-12-30T10:11:12Z"}`, wantStatus: http.StatusBadRequest},
 	}
 
-	gateway := &Gateway{client: &Client{cfg: testConfig(openSearch)}}
+	gateway := testGatewayHandler(testConfig(openSearch))
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
@@ -639,7 +667,7 @@ func TestGatewayOpenSearchFailuresReturnBadGateway(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/ingest/orders", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z"}`))
 			request.Header.Set("Content-Type", "application/json")
 
-			(&Gateway{client: &Client{cfg: testConfig(openSearch)}}).ServeHTTP(recorder, request)
+			testGatewayHandler(testConfig(openSearch)).ServeHTTP(recorder, request)
 
 			if recorder.Code != http.StatusBadGateway {
 				t.Fatalf("expected status 502, got %d: %s", recorder.Code, recorder.Body.String())
@@ -674,7 +702,7 @@ func TestGatewayTenantFailureReturnsBadGateway(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/ingest/orders", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"hello"}`))
 	request.Header.Set("Content-Type", "application/json")
 
-	(&Gateway{client: &Client{cfg: testConfigWithDashboards(openSearch, dashboards)}}).ServeHTTP(recorder, request)
+	testGatewayHandler(testConfigWithDashboards(openSearch, dashboards)).ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502, got %d: %s", recorder.Code, recorder.Body.String())
@@ -716,7 +744,7 @@ func TestGatewayDataViewFailureReturnsBadGateway(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/ingest/orders", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"hello"}`))
 	request.Header.Set("Content-Type", "application/json")
 
-	(&Gateway{client: &Client{cfg: testConfigWithDashboards(openSearch, dashboards)}}).ServeHTTP(recorder, request)
+	testGatewayHandler(testConfigWithDashboards(openSearch, dashboards)).ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("expected status 502, got %d: %s", recorder.Code, recorder.Body.String())
@@ -773,7 +801,7 @@ func TestGatewayBootstrapConflictRetriesAliasCheck(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/ingest/orders", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"hello"}`))
 	request.Header.Set("Content-Type", "application/json")
 
-	(&Gateway{client: &Client{cfg: testConfig(openSearch)}}).ServeHTTP(recorder, request)
+	testGatewayHandler(testConfig(openSearch)).ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("expected status 201, got %d: %s", recorder.Code, recorder.Body.String())
@@ -848,6 +876,10 @@ func testConfigWithDashboards(openSearch, dashboards *httptest.Server) Config {
 	cfg.DashboardsURL = dashboards.URL
 	cfg.HTTPClient = openSearch.Client()
 	return cfg
+}
+
+func testGatewayHandler(cfg Config) http.Handler {
+	return (&Gateway{client: &Client{cfg: cfg}}).Handler()
 }
 
 func decodeRequestBody(t *testing.T, r *http.Request) map[string]any {
