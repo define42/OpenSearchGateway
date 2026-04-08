@@ -15,11 +15,6 @@ var (
 	errLDAPUnauthorized       = errors.New("ldap user has no authorized groups")
 )
 
-func ldapAuthenticate(username, password string) (*User, error) {
-	user, _, err := ldapAuthenticateAccess(username, password)
-	return user, err
-}
-
 func ldapAuthenticateAccess(username, password string) (*User, []Access, error) {
 	conn, err := dialLDAP(ldapCfg)
 	if err != nil {
