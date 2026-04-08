@@ -271,21 +271,26 @@ func TestEnsureDashboardDataViewCreatesExpectedPattern(t *testing.T) {
 	defer openSearch.Close()
 
 	var requestBody map[string]any
+	var defaultIndexBody map[string]any
 	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		expectedPath := "/dashboards/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true"
-		if r.Method != http.MethodPost || r.URL.RequestURI() != expectedPath {
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
-		}
 		if got := r.Header.Get("osd-xsrf"); got != "true" {
 			t.Fatalf("expected osd-xsrf header, got %q", got)
 		}
 		if got := r.Header.Get("securitytenant"); got != "orders" {
 			t.Fatalf("expected securitytenant header, got %q", got)
 		}
-
-		requestBody = decodeRequestBody(t, r)
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{}`)
+		switch r.Method + " " + r.URL.RequestURI() {
+		case "POST /dashboards/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true":
+			requestBody = decodeRequestBody(t, r)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		case "POST /dashboards/api/opensearch-dashboards/settings/defaultIndex":
+			defaultIndexBody = decodeRequestBody(t, r)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
+		}
 	}))
 	defer dashboards.Close()
 
@@ -307,6 +312,9 @@ func TestEnsureDashboardDataViewCreatesExpectedPattern(t *testing.T) {
 	}
 	if got := attributes["timeFieldName"]; got != "event_time" {
 		t.Fatalf("unexpected time field: %#v", got)
+	}
+	if got := defaultIndexBody["value"]; got != "gateway-index-pattern-orders" {
+		t.Fatalf("unexpected default index body: %#v", defaultIndexBody)
 	}
 }
 
@@ -341,15 +349,21 @@ func TestGatewayIngestEnsuresDashboardDataView(t *testing.T) {
 	defer openSearch.Close()
 
 	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.RequestURI() != "/dashboards/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true" {
-			t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.RequestURI())
-		}
 		if got := r.Header.Get("securitytenant"); got != "orders" {
 			t.Fatalf("expected securitytenant header, got %q", got)
 		}
-		appendCall("data-view-post")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{}`)
+		switch r.Method + " " + r.URL.RequestURI() {
+		case "POST /dashboards/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true":
+			appendCall("data-view-post")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		case "POST /dashboards/api/opensearch-dashboards/settings/defaultIndex":
+			appendCall("default-index-post")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.RequestURI())
+		}
 	}))
 	defer dashboards.Close()
 
@@ -365,6 +379,7 @@ func TestGatewayIngestEnsuresDashboardDataView(t *testing.T) {
 	if !reflect.DeepEqual(calls, []string{
 		"tenant-get",
 		"data-view-post",
+		"default-index-post",
 		"alias-head",
 		"doc-post",
 	}) {
@@ -661,14 +676,19 @@ func TestGatewayLoginSuccessProvisionsUserAndSession(t *testing.T) {
 	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dashboardsCalls = append(dashboardsCalls, r.Method+" "+r.URL.RequestURI())
 
-		if r.Method != http.MethodPost || r.URL.RequestURI() != "/dashboards/api/saved_objects/index-pattern/gateway-index-pattern-team1?overwrite=true" {
-			t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.RequestURI())
-		}
 		if got := r.Header.Get("securitytenant"); got != "team1" {
 			t.Fatalf("expected securitytenant header, got %q", got)
 		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{}`)
+		switch r.Method + " " + r.URL.RequestURI() {
+		case "POST /dashboards/api/saved_objects/index-pattern/gateway-index-pattern-team1?overwrite=true":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		case "POST /dashboards/api/opensearch-dashboards/settings/defaultIndex":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.RequestURI())
+		}
 	}))
 	defer dashboards.Close()
 
@@ -705,6 +725,7 @@ func TestGatewayLoginSuccessProvisionsUserAndSession(t *testing.T) {
 	}
 	if !reflect.DeepEqual(dashboardsCalls, []string{
 		"POST /dashboards/api/saved_objects/index-pattern/gateway-index-pattern-team1?overwrite=true",
+		"POST /dashboards/api/opensearch-dashboards/settings/defaultIndex",
 	}) {
 		t.Fatalf("unexpected Dashboards sequence: %#v", dashboardsCalls)
 	}
@@ -713,13 +734,23 @@ func TestGatewayLoginSuccessProvisionsUserAndSession(t *testing.T) {
 	if !ok || len(clusterPermissions) == 0 {
 		t.Fatalf("expected cluster permissions, got %#v", roleBody)
 	}
+	if !reflect.DeepEqual(clusterPermissions, []any{"cluster_composite_ops", "indices_monitor", "cluster:admin/opensearch/ql/datasources/read"}) {
+		t.Fatalf("unexpected cluster permissions: %#v", clusterPermissions)
+	}
 	indexPermissions, ok := roleBody["index_permissions"].([]any)
-	if !ok || len(indexPermissions) != 1 {
+	if !ok || len(indexPermissions) != 2 {
 		t.Fatalf("expected index permissions, got %#v", roleBody)
 	}
 	indexPermission := nestedMap(t, indexPermissions[0])
 	if got := indexPermission["allowed_actions"]; !reflect.DeepEqual(got, []any{"crud"}) {
 		t.Fatalf("unexpected allowed actions: %#v", got)
+	}
+	resolvePermission := nestedMap(t, indexPermissions[1])
+	if got := resolvePermission["index_patterns"]; !reflect.DeepEqual(got, []any{"*"}) {
+		t.Fatalf("unexpected resolve index patterns: %#v", got)
+	}
+	if got := resolvePermission["allowed_actions"]; !reflect.DeepEqual(got, []any{"indices:admin/resolve/index"}) {
+		t.Fatalf("unexpected resolve index actions: %#v", got)
 	}
 	tenantPermissions, ok := roleBody["tenant_permissions"].([]any)
 	if !ok || len(tenantPermissions) != 1 {
@@ -756,8 +787,8 @@ func TestRoleRequestForAccessModes(t *testing.T) {
 		wantAllowed       []string
 		wantTenantAllowed string
 	}{
-		{name: "read", access: Access{Namespace: "team1", PullOnly: true}, wantAllowed: []string{"read"}, wantTenantAllowed: "kibana_all_read"},
-		{name: "read delete", access: Access{Namespace: "team1", PullOnly: true, DeleteAllowed: true}, wantAllowed: []string{"read", "delete"}, wantTenantAllowed: "kibana_all_read"},
+		{name: "read", access: Access{Namespace: "team1", PullOnly: true}, wantAllowed: []string{"read"}, wantTenantAllowed: "kibana_all_write"},
+		{name: "read delete", access: Access{Namespace: "team1", PullOnly: true, DeleteAllowed: true}, wantAllowed: []string{"read", "delete"}, wantTenantAllowed: "kibana_all_write"},
 		{name: "read write", access: Access{Namespace: "team1", PullOnly: false}, wantAllowed: []string{"read", "write"}, wantTenantAllowed: "kibana_all_write"},
 		{name: "read write delete", access: Access{Namespace: "team1", PullOnly: false, DeleteAllowed: true}, wantAllowed: []string{"crud"}, wantTenantAllowed: "kibana_all_write"},
 	}
@@ -768,8 +799,17 @@ func TestRoleRequestForAccessModes(t *testing.T) {
 			if got := role.IndexPermissions[0].AllowedActions; !reflect.DeepEqual(got, tt.wantAllowed) {
 				t.Fatalf("unexpected allowed actions: %#v", got)
 			}
+			if got := role.IndexPermissions[1].IndexPatterns; !reflect.DeepEqual(got, []string{"*"}) {
+				t.Fatalf("unexpected resolve index patterns: %#v", got)
+			}
+			if got := role.IndexPermissions[1].AllowedActions; !reflect.DeepEqual(got, []string{"indices:admin/resolve/index"}) {
+				t.Fatalf("unexpected resolve index actions: %#v", got)
+			}
 			if got := role.TenantPermissions[0].AllowedActions; !reflect.DeepEqual(got, []string{tt.wantTenantAllowed}) {
 				t.Fatalf("unexpected tenant actions: %#v", got)
+			}
+			if !strings.Contains(strings.Join(role.ClusterPermissions, ","), "cluster:admin/opensearch/ql/datasources/read") {
+				t.Fatalf("expected datasources cluster permission, got %#v", role.ClusterPermissions)
 			}
 		})
 	}
@@ -904,6 +944,100 @@ func TestGatewayDashboardsProxyDoesNotAutoSelectTenantForMultiNamespaceSession(t
 	}
 	if upstreamTenant != "" {
 		t.Fatalf("expected no auto-selected tenant for multi-namespace session, got %q", upstreamTenant)
+	}
+}
+
+func TestGatewayDashboardsProxySynthesizesTenantIndexPatternFindResults(t *testing.T) {
+	t.Parallel()
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer openSearch.Close()
+
+	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("securitytenant"); got != "team1" {
+			t.Fatalf("expected securitytenant header, got %q", got)
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/dashboards/api/saved_objects/_find" {
+			t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"page":1,"per_page":10000,"total":0,"saved_objects":[]}`)
+	}))
+	defer dashboards.Close()
+
+	gateway := newGateway(&Client{cfg: testConfigWithDashboards(openSearch, dashboards)}, nil)
+	token, expiresAt, err := gateway.sessions.Create(sessionData{
+		User:       &User{Name: "testuser"},
+		AuthHeader: buildBasicAuthorization("testuser", "dogood"),
+		Namespaces: []string{"team1"},
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/dashboards/api/saved_objects/_find?fields=title&per_page=10000&type=index-pattern", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token, Expires: expiresAt})
+
+	gateway.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var payload dashboardsFindResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode proxy response: %v", err)
+	}
+	if payload.Total != 1 || len(payload.SavedObjects) != 1 {
+		t.Fatalf("expected synthesized saved object, got %#v", payload)
+	}
+	if got := payload.SavedObjects[0].ID; got != buildDataViewID("team1") {
+		t.Fatalf("unexpected data view id: %q", got)
+	}
+	if got := payload.SavedObjects[0].Attributes.Title; got != "team1-*" {
+		t.Fatalf("unexpected data view title: %q", got)
+	}
+}
+
+func TestGatewayDashboardsProxyLeavesNonEmptyIndexPatternFindResultsUntouched(t *testing.T) {
+	t.Parallel()
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer openSearch.Close()
+
+	const upstreamBody = `{"page":1,"per_page":10000,"total":1,"saved_objects":[{"id":"upstream-pattern","type":"index-pattern","attributes":{"title":"custom-*","timeFieldName":"event_time"}}]}`
+	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer dashboards.Close()
+
+	gateway := newGateway(&Client{cfg: testConfigWithDashboards(openSearch, dashboards)}, nil)
+	token, expiresAt, err := gateway.sessions.Create(sessionData{
+		User:       &User{Name: "testuser"},
+		AuthHeader: buildBasicAuthorization("testuser", "dogood"),
+		Namespaces: []string{"team1"},
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/dashboards/api/saved_objects/_find?fields=title&per_page=10000&type=index-pattern", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token, Expires: expiresAt})
+
+	gateway.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if body := strings.TrimSpace(recorder.Body.String()); body != upstreamBody {
+		t.Fatalf("expected upstream body to pass through, got %s", body)
 	}
 }
 

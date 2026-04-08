@@ -59,7 +59,6 @@ func ldapAuthenticateAccess(username, password string) (*User, []Access, error) 
 	}
 
 	filter := fmt.Sprintf(ldapCfg.UserFilter, mail)
-	fmt.Println("filter", filter)
 	searchReq := ldap.NewSearchRequest(
 		ldapCfg.BaseDN,
 		ldap.ScopeWholeSubtree,

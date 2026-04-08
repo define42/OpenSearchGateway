@@ -154,6 +154,24 @@ type dashboardsDataViewAttributes struct {
 	TimeFieldName string `json:"timeFieldName"`
 }
 
+type dashboardsSavedObjectResponse struct {
+	ID         string                       `json:"id"`
+	Type       string                       `json:"type"`
+	Attributes dashboardsDataViewAttributes `json:"attributes"`
+	References []any                        `json:"references,omitempty"`
+}
+
+type dashboardsFindResponse struct {
+	Page         int                             `json:"page"`
+	PerPage      int                             `json:"per_page"`
+	Total        int                             `json:"total"`
+	SavedObjects []dashboardsSavedObjectResponse `json:"saved_objects"`
+}
+
+type dashboardsSettingValueRequest struct {
+	Value string `json:"value"`
+}
+
 type loginPageData struct {
 	Error    string
 	Username string
@@ -1065,6 +1083,9 @@ func (g *Gateway) proxyDashboards(w http.ResponseWriter, r *http.Request, sessio
 		req.Header.Set("X-Forwarded-Host", originalHost)
 		req.Header.Set("X-Forwarded-Proto", forwardedProto(r))
 	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		return g.modifyDashboardsResponse(resp, session)
+	}
 	proxy.ErrorHandler = func(proxyWriter http.ResponseWriter, proxyRequest *http.Request, proxyErr error) {
 		writeErrorJSON(proxyWriter, http.StatusBadGateway, fmt.Sprintf("Dashboards proxy failed: %v", proxyErr))
 	}
@@ -1073,11 +1094,90 @@ func (g *Gateway) proxyDashboards(w http.ResponseWriter, r *http.Request, sessio
 	return nil
 }
 
+func (g *Gateway) modifyDashboardsResponse(resp *http.Response, session sessionData) error {
+	if resp == nil || resp.Request == nil {
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK || resp.Request.Method != http.MethodGet {
+		return nil
+	}
+	if !isDashboardsIndexPatternFindRequest(resp.Request) {
+		return nil
+	}
+
+	tenantName := strings.TrimSpace(resp.Request.Header.Get("securitytenant"))
+	if tenantName == "" {
+		tenantName = sessionDefaultTenant(session)
+	}
+	if tenantName == "" || !sessionHasNamespace(session, tenantName) {
+		return nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+
+	restoreBody := func(payload []byte) {
+		resp.Body = io.NopCloser(bytes.NewReader(payload))
+		resp.ContentLength = int64(len(payload))
+		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(payload)))
+	}
+
+	var payload dashboardsFindResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		restoreBody(body)
+		return nil
+	}
+	if payload.Total != 0 || !matchesIndexPatternFindQuery(resp.Request.URL.Query(), tenantName) {
+		restoreBody(body)
+		return nil
+	}
+
+	synthetic := dashboardsFindResponse{
+		Page:    payload.Page,
+		PerPage: payload.PerPage,
+		Total:   1,
+		SavedObjects: []dashboardsSavedObjectResponse{
+			{
+				ID:   buildDataViewID(tenantName),
+				Type: "index-pattern",
+				Attributes: dashboardsDataViewAttributes{
+					Title:         buildDataViewPattern(tenantName),
+					TimeFieldName: "event_time",
+				},
+				References: []any{},
+			},
+		},
+	}
+	if payload.Page > 1 || payload.PerPage == 0 {
+		synthetic.SavedObjects = []dashboardsSavedObjectResponse{}
+	}
+
+	replacement, err := json.Marshal(synthetic)
+	if err != nil {
+		return err
+	}
+	restoreBody(replacement)
+	resp.Header.Set("Content-Type", "application/json; charset=utf-8")
+	return nil
+}
+
 func sessionDefaultTenant(session sessionData) string {
 	if len(session.Namespaces) != 1 {
 		return ""
 	}
 	return strings.TrimSpace(session.Namespaces[0])
+}
+
+func sessionHasNamespace(session sessionData, tenantName string) bool {
+	for _, namespace := range session.Namespaces {
+		if strings.TrimSpace(namespace) == tenantName {
+			return true
+		}
+	}
+	return false
 }
 
 func parseIngestPath(path string) (string, error) {
@@ -1343,8 +1443,21 @@ func (c *Client) EnsureDashboardDataView(ctx context.Context, indexName string) 
 	if err := c.doDashboardsJSONInTenant(ctx, tenantName, http.MethodPost, path, body, nil, []int{http.StatusOK, http.StatusCreated}); err != nil {
 		return err
 	}
+	if err := c.setDashboardsDefaultIndex(ctx, tenantName, dataViewID); err != nil {
+		return err
+	}
 
 	c.ensuredDataViews.Store(cacheKey, true)
+	return nil
+}
+
+func (c *Client) setDashboardsDefaultIndex(ctx context.Context, tenantName, dataViewID string) error {
+	body := dashboardsSettingValueRequest{
+		Value: dataViewID,
+	}
+	if err := c.doDashboardsJSONInTenant(ctx, tenantName, http.MethodPost, "/api/opensearch-dashboards/settings/defaultIndex", body, nil, []int{http.StatusOK}); err != nil {
+		return fmt.Errorf("set Dashboards default index for tenant %q: %w", tenantName, err)
+	}
 	return nil
 }
 
@@ -1619,11 +1732,7 @@ func roleRequestForAccess(access Access) securityRoleRequest {
 	if mode == "rw" || mode == "rwd" {
 		clusterPermissions = []string{"cluster_composite_ops", "indices_monitor"}
 	}
-
-	tenantAction := "kibana_all_read"
-	if mode == "rw" || mode == "rwd" {
-		tenantAction = "kibana_all_write"
-	}
+	clusterPermissions = append(clusterPermissions, "cluster:admin/opensearch/ql/datasources/read")
 
 	return securityRoleRequest{
 		ClusterPermissions: clusterPermissions,
@@ -1632,14 +1741,47 @@ func roleRequestForAccess(access Access) securityRoleRequest {
 				IndexPatterns:  []string{buildDataViewPattern(access.Namespace)},
 				AllowedActions: allowedActionsForAccess(mode),
 			},
+			{
+				// Dashboards resolves wildcard patterns against every visible index name.
+				IndexPatterns:  []string{"*"},
+				AllowedActions: []string{"indices:admin/resolve/index"},
+			},
 		},
 		TenantPermissions: []securityTenantPermission{
 			{
 				TenantPatterns: []string{access.Namespace},
-				AllowedActions: []string{tenantAction},
+				// Dashboards updates saved object metadata and defaultIndex even for read-only users.
+				AllowedActions: []string{"kibana_all_write"},
 			},
 		},
 	}
+}
+
+func isDashboardsIndexPatternFindRequest(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	if req.URL.Path != dashboardsAPIPath("/api/saved_objects/_find") {
+		return false
+	}
+
+	for _, item := range req.URL.Query()["type"] {
+		if item == "index-pattern" {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesIndexPatternFindQuery(values url.Values, tenantName string) bool {
+	search := strings.TrimSpace(strings.Trim(values.Get("search"), "*"))
+	if search == "" {
+		return true
+	}
+
+	title := buildDataViewPattern(tenantName)
+	id := buildDataViewID(tenantName)
+	return strings.Contains(title, search) || strings.Contains(id, search) || strings.Contains(tenantName, search)
 }
 
 func allowedActionsForAccess(mode string) []string {
