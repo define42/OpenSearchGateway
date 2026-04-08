@@ -4,7 +4,7 @@
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/define42/opensearchgateway)](https://goreportcard.com/report/github.com/define42/opensearchgateway)
 
-[![Build Status](https://github.com/define42/opensearchgateway/actions/workflows/go.yml/badge.svg)](https://github.com/define42/opensearchgateway/actions/)
+[![Build Status](https://github.com/define42/opensearchgateway/actions/workflows/build.yml/badge.svg)](https://github.com/define42/opensearchgateway/actions/)
 
 OpenSearchGateway is a small Go web server that sits in front of an OpenSearch cluster and does two jobs:
 
