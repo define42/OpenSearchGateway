@@ -1,0 +1,14 @@
+server.host: 0.0.0.0
+server.ssl.enabled: false
+server.basePath: /dashboards
+server.rewriteBasePath: true
+
+opensearch.hosts:
+  - https://opensearch:9200
+opensearch.ssl.verificationMode: none
+opensearch.username: kibanaserver
+opensearch.password: kibanaserver
+
+opensearch.requestHeadersWhitelist:
+  - Authorization
+  - securitytenant

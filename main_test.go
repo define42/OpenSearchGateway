@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRunBootstrapsBeforeServe(t *testing.T) {
@@ -271,7 +272,7 @@ func TestEnsureDashboardDataViewCreatesExpectedPattern(t *testing.T) {
 
 	var requestBody map[string]any
 	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		expectedPath := "/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true"
+		expectedPath := "/dashboards/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true"
 		if r.Method != http.MethodPost || r.URL.RequestURI() != expectedPath {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
 		}
@@ -340,7 +341,7 @@ func TestGatewayIngestEnsuresDashboardDataView(t *testing.T) {
 	defer openSearch.Close()
 
 	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.RequestURI() != "/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true" {
+		if r.Method != http.MethodPost || r.URL.RequestURI() != "/dashboards/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true" {
 			t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.RequestURI())
 		}
 		if got := r.Header.Get("securitytenant"); got != "orders" {
@@ -371,10 +372,65 @@ func TestGatewayIngestEnsuresDashboardDataView(t *testing.T) {
 	}
 }
 
+func TestGatewayRootRedirectsToLogin(t *testing.T) {
+	t.Parallel()
+
+	gateway := testGatewayHandler(Config{})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected status 303, got %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("Location"); got != "/login" {
+		t.Fatalf("expected redirect to /login, got %q", got)
+	}
+}
+
+func TestGatewayLoginServesLoginForm(t *testing.T) {
+	t.Parallel()
+
+	gateway := testGatewayHandler(Config{})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Fatalf("expected HTML content type, got %q", got)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "<form") || !strings.Contains(body, "Username") || !strings.Contains(body, "Password") {
+		t.Fatalf("expected login form content, got %q", body)
+	}
+}
+
+func TestGatewayLoginRejectsUnsupportedMethod(t *testing.T) {
+	t.Parallel()
+
+	gateway := testGatewayHandler(Config{})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/login", nil)
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status 405, got %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("Allow"); got != http.MethodGet+", "+http.MethodPost {
+		t.Fatalf("expected Allow header for login, got %q", got)
+	}
+}
+
 func TestGatewayDemoServesDemoForm(t *testing.T) {
 	t.Parallel()
 
-	gateway := (&Gateway{client: &Client{cfg: Config{}}}).Handler()
+	gateway := testGatewayHandler(Config{})
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/demo", nil)
 
@@ -398,7 +454,7 @@ func TestGatewayDemoServesDemoForm(t *testing.T) {
 func TestGatewayDemoRejectsNonGet(t *testing.T) {
 	t.Parallel()
 
-	gateway := (&Gateway{client: &Client{cfg: Config{}}}).Handler()
+	gateway := testGatewayHandler(Config{})
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/demo", nil)
 
@@ -412,12 +468,12 @@ func TestGatewayDemoRejectsNonGet(t *testing.T) {
 	}
 }
 
-func TestGatewayRootReturnsNotFound(t *testing.T) {
+func TestGatewayIngestBasePathReturnsNotFound(t *testing.T) {
 	t.Parallel()
 
-	gateway := (&Gateway{client: &Client{cfg: Config{}}}).Handler()
+	gateway := testGatewayHandler(Config{})
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request := httptest.NewRequest(http.MethodPost, "/ingest", nil)
 
 	gateway.ServeHTTP(recorder, request)
 
@@ -426,17 +482,501 @@ func TestGatewayRootReturnsNotFound(t *testing.T) {
 	}
 }
 
-func TestGatewayIngestBasePathReturnsNotFound(t *testing.T) {
+func TestGatewayAuthenticatedLoginRedirectsToDashboards(t *testing.T) {
 	t.Parallel()
 
-	gateway := (&Gateway{client: &Client{cfg: Config{}}}).Handler()
+	gateway := newGateway(&Client{cfg: Config{}}, nil)
+	token, expiresAt, err := gateway.sessions.Create(sessionData{
+		User:       &User{Name: "alice"},
+		Namespaces: []string{"team1"},
+		AuthHeader: buildBasicAuthorization("alice", "secret"),
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/ingest", nil)
+	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token, Expires: expiresAt})
+
+	gateway.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected status 303, got %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("Location"); got != "/dashboards/" {
+		t.Fatalf("expected redirect to /dashboards/, got %q", got)
+	}
+}
+
+func TestGatewayLoginInvalidCredentialsReturnsUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer openSearch.Close()
+
+	gateway := testGatewayHandlerWithAuth(testConfig(openSearch), func(username, password string) (*User, []Access, error) {
+		return nil, nil, errLDAPInvalidCredentials
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=testuser&password=wrong"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	gateway.ServeHTTP(recorder, request)
 
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("expected status 404, got %d", recorder.Code)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Header().Get("Set-Cookie"), sessionCookieName+"=") {
+		t.Fatalf("did not expect session cookie on failed login")
+	}
+}
+
+func TestGatewayLoginUnauthorizedGroupsReturnsForbidden(t *testing.T) {
+	t.Parallel()
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer openSearch.Close()
+
+	gateway := testGatewayHandlerWithAuth(testConfig(openSearch), func(username, password string) (*User, []Access, error) {
+		return nil, nil, errLDAPUnauthorized
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=testuser&password=dogood"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestGatewayLoginLDAPFailureReturnsBadGateway(t *testing.T) {
+	t.Parallel()
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer openSearch.Close()
+
+	gateway := testGatewayHandlerWithAuth(testConfig(openSearch), func(username, password string) (*User, []Access, error) {
+		return nil, nil, errors.New("ldap server unavailable")
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=testuser&password=dogood"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("expected status 502, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestGatewayLoginReservedInternalUserReturnsForbidden(t *testing.T) {
+	t.Parallel()
+
+	var openSearchCalls []string
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openSearchCalls = append(openSearchCalls, r.Method+" "+r.URL.Path)
+
+		if r.Method != http.MethodGet || r.URL.Path != "/_plugins/_security/api/internalusers/testuser" {
+			t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"testuser":{"reserved":true,"hidden":false}}`)
+	}))
+	defer openSearch.Close()
+
+	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer dashboards.Close()
+
+	gateway := testGatewayHandlerWithAuth(testConfigWithDashboards(openSearch, dashboards), func(username, password string) (*User, []Access, error) {
+		return &User{Name: username, Namespace: "team1", PullOnly: false, DeleteAllowed: true}, []Access{
+			{Group: "team1_rwd", Namespace: "team1", PullOnly: false, DeleteAllowed: true},
+		}, nil
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=testuser&password=dogood"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !reflect.DeepEqual(openSearchCalls, []string{
+		"GET /_plugins/_security/api/internalusers/testuser",
+	}) {
+		t.Fatalf("unexpected OpenSearch sequence: %#v", openSearchCalls)
+	}
+}
+
+func TestGatewayLoginSuccessProvisionsUserAndSession(t *testing.T) {
+	t.Parallel()
+
+	var openSearchCalls []string
+	var roleBody map[string]any
+	var tenantBody map[string]any
+	var userBody map[string]any
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openSearchCalls = append(openSearchCalls, r.Method+" "+r.URL.Path)
+
+		switch r.Method + " " + r.URL.Path {
+		case "GET /_plugins/_security/api/internalusers/testuser":
+			http.NotFound(w, r)
+		case "PUT /_plugins/_security/api/roles/gateway_team1_rwd":
+			roleBody = decodeRequestBody(t, r)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{}`)
+		case "GET /_plugins/_security/api/tenants/team1":
+			http.NotFound(w, r)
+		case "PUT /_plugins/_security/api/tenants/team1":
+			tenantBody = decodeRequestBody(t, r)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{}`)
+		case "PUT /_plugins/_security/api/internalusers/testuser":
+			userBody = decodeRequestBody(t, r)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer openSearch.Close()
+
+	var dashboardsCalls []string
+	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dashboardsCalls = append(dashboardsCalls, r.Method+" "+r.URL.RequestURI())
+
+		if r.Method != http.MethodPost || r.URL.RequestURI() != "/dashboards/api/saved_objects/index-pattern/gateway-index-pattern-team1?overwrite=true" {
+			t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.RequestURI())
+		}
+		if got := r.Header.Get("securitytenant"); got != "team1" {
+			t.Fatalf("expected securitytenant header, got %q", got)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer dashboards.Close()
+
+	gateway := testGatewayHandlerWithAuth(testConfigWithDashboards(openSearch, dashboards), func(username, password string) (*User, []Access, error) {
+		return &User{Name: username, Namespace: "team1", PullOnly: false, DeleteAllowed: true}, []Access{
+			{Group: "team1_rwd", Namespace: "team1", PullOnly: false, DeleteAllowed: true},
+		}, nil
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=testuser&password=dogood"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected status 303, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Location"); got != "/dashboards/" {
+		t.Fatalf("expected redirect to /dashboards/, got %q", got)
+	}
+	if !strings.Contains(recorder.Header().Get("Set-Cookie"), sessionCookieName+"=") {
+		t.Fatalf("expected session cookie, got %q", recorder.Header().Get("Set-Cookie"))
+	}
+
+	if !reflect.DeepEqual(openSearchCalls, []string{
+		"GET /_plugins/_security/api/internalusers/testuser",
+		"PUT /_plugins/_security/api/roles/gateway_team1_rwd",
+		"GET /_plugins/_security/api/tenants/team1",
+		"PUT /_plugins/_security/api/tenants/team1",
+		"PUT /_plugins/_security/api/internalusers/testuser",
+	}) {
+		t.Fatalf("unexpected OpenSearch sequence: %#v", openSearchCalls)
+	}
+	if !reflect.DeepEqual(dashboardsCalls, []string{
+		"POST /dashboards/api/saved_objects/index-pattern/gateway-index-pattern-team1?overwrite=true",
+	}) {
+		t.Fatalf("unexpected Dashboards sequence: %#v", dashboardsCalls)
+	}
+
+	clusterPermissions, ok := roleBody["cluster_permissions"].([]any)
+	if !ok || len(clusterPermissions) == 0 {
+		t.Fatalf("expected cluster permissions, got %#v", roleBody)
+	}
+	indexPermissions, ok := roleBody["index_permissions"].([]any)
+	if !ok || len(indexPermissions) != 1 {
+		t.Fatalf("expected index permissions, got %#v", roleBody)
+	}
+	indexPermission := nestedMap(t, indexPermissions[0])
+	if got := indexPermission["allowed_actions"]; !reflect.DeepEqual(got, []any{"crud"}) {
+		t.Fatalf("unexpected allowed actions: %#v", got)
+	}
+	tenantPermissions, ok := roleBody["tenant_permissions"].([]any)
+	if !ok || len(tenantPermissions) != 1 {
+		t.Fatalf("expected tenant permissions, got %#v", roleBody)
+	}
+	tenantPermission := nestedMap(t, tenantPermissions[0])
+	if got := tenantPermission["allowed_actions"]; !reflect.DeepEqual(got, []any{"kibana_all_write"}) {
+		t.Fatalf("unexpected tenant actions: %#v", got)
+	}
+	if got := tenantBody["description"]; got != "Gateway tenant for team1" {
+		t.Fatalf("unexpected tenant description: %#v", got)
+	}
+	if got, exists := userBody["password"]; exists {
+		t.Fatalf("expected hashed OpenSearch password payload, got plaintext field %#v", got)
+	}
+	hash, ok := userBody["hash"].(string)
+	if !ok || hash == "" {
+		t.Fatalf("expected OpenSearch password hash, got %#v", userBody["hash"])
+	}
+	if strings.Contains(hash, "dogood") {
+		t.Fatalf("expected hashed OpenSearch password, got %#v", hash)
+	}
+	if got := userBody["opendistro_security_roles"]; !reflect.DeepEqual(got, []any{"kibana_user", "gateway_team1_rwd"}) {
+		t.Fatalf("unexpected OpenSearch roles: %#v", got)
+	}
+}
+
+func TestRoleRequestForAccessModes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		access            Access
+		wantAllowed       []string
+		wantTenantAllowed string
+	}{
+		{name: "read", access: Access{Namespace: "team1", PullOnly: true}, wantAllowed: []string{"read"}, wantTenantAllowed: "kibana_all_read"},
+		{name: "read delete", access: Access{Namespace: "team1", PullOnly: true, DeleteAllowed: true}, wantAllowed: []string{"read", "delete"}, wantTenantAllowed: "kibana_all_read"},
+		{name: "read write", access: Access{Namespace: "team1", PullOnly: false}, wantAllowed: []string{"read", "write"}, wantTenantAllowed: "kibana_all_write"},
+		{name: "read write delete", access: Access{Namespace: "team1", PullOnly: false, DeleteAllowed: true}, wantAllowed: []string{"crud"}, wantTenantAllowed: "kibana_all_write"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			role := roleRequestForAccess(tt.access)
+			if got := role.IndexPermissions[0].AllowedActions; !reflect.DeepEqual(got, tt.wantAllowed) {
+				t.Fatalf("unexpected allowed actions: %#v", got)
+			}
+			if got := role.TenantPermissions[0].AllowedActions; !reflect.DeepEqual(got, []string{tt.wantTenantAllowed}) {
+				t.Fatalf("unexpected tenant actions: %#v", got)
+			}
+		})
+	}
+}
+
+func TestNormalizeAccessByNamespaceCombinesPermissions(t *testing.T) {
+	t.Parallel()
+
+	result := normalizeAccessByNamespace([]Access{
+		{Group: "team1_rw", Namespace: "team1", PullOnly: false},
+		{Group: "team1_rd", Namespace: "team1", PullOnly: true, DeleteAllowed: true},
+		{Group: "team2_r", Namespace: "team2", PullOnly: true},
+	})
+
+	if len(result) != 2 {
+		t.Fatalf("expected two namespaces, got %#v", result)
+	}
+	if got := roleModeForAccess(result[0]); got != "rwd" {
+		t.Fatalf("expected team1 to combine to rwd, got %q", got)
+	}
+	if got := roleModeForAccess(result[1]); got != "r" {
+		t.Fatalf("expected team2 to remain r, got %q", got)
+	}
+}
+
+func TestGatewayDashboardsRequiresLogin(t *testing.T) {
+	t.Parallel()
+
+	gateway := testGatewayHandler(Config{DashboardsURL: "http://dashboards.example"})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/dashboards/app/home", nil)
+
+	gateway.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected status 303, got %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("Location"); got != "/login" {
+		t.Fatalf("expected redirect to /login, got %q", got)
+	}
+}
+
+func TestGatewayDashboardsProxyForwardsSessionBasicAuth(t *testing.T) {
+	t.Parallel()
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer openSearch.Close()
+
+	var upstreamAuth string
+	var upstreamPath string
+	var upstreamQuery string
+	var upstreamTenant string
+	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAuth = r.Header.Get("Authorization")
+		upstreamTenant = r.Header.Get("securitytenant")
+		upstreamPath = r.URL.Path
+		upstreamQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "proxied dashboards")
+	}))
+	defer dashboards.Close()
+
+	gateway := newGateway(&Client{cfg: testConfigWithDashboards(openSearch, dashboards)}, nil)
+	token, expiresAt, err := gateway.sessions.Create(sessionData{
+		User:       &User{Name: "testuser"},
+		AuthHeader: buildBasicAuthorization("testuser", "dogood"),
+		Namespaces: []string{"team1"},
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/dashboards/app/home?foo=bar", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token, Expires: expiresAt})
+
+	gateway.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamAuth != buildBasicAuthorization("testuser", "dogood") {
+		t.Fatalf("unexpected Authorization header: %q", upstreamAuth)
+	}
+	if upstreamTenant != "team1" {
+		t.Fatalf("expected single namespace tenant header, got %q", upstreamTenant)
+	}
+	if upstreamPath != "/dashboards/app/home" || upstreamQuery != "foo=bar" {
+		t.Fatalf("unexpected upstream request: path=%q query=%q", upstreamPath, upstreamQuery)
+	}
+	if body := recorder.Body.String(); body != "proxied dashboards" {
+		t.Fatalf("unexpected proxy body: %q", body)
+	}
+}
+
+func TestGatewayDashboardsProxyDoesNotAutoSelectTenantForMultiNamespaceSession(t *testing.T) {
+	t.Parallel()
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer openSearch.Close()
+
+	var upstreamTenant string
+	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamTenant = r.Header.Get("securitytenant")
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "proxied dashboards")
+	}))
+	defer dashboards.Close()
+
+	gateway := newGateway(&Client{cfg: testConfigWithDashboards(openSearch, dashboards)}, nil)
+	token, expiresAt, err := gateway.sessions.Create(sessionData{
+		User:       &User{Name: "testuser"},
+		AuthHeader: buildBasicAuthorization("testuser", "dogood"),
+		Namespaces: []string{"team1", "team2"},
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/dashboards/app/home", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token, Expires: expiresAt})
+
+	gateway.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamTenant != "" {
+		t.Fatalf("expected no auto-selected tenant for multi-namespace session, got %q", upstreamTenant)
+	}
+}
+
+func TestGatewayLogoutClearsSession(t *testing.T) {
+	t.Parallel()
+
+	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected OpenSearch request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer openSearch.Close()
+
+	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected Dashboards request after logout: %s %s", r.Method, r.URL.Path)
+	}))
+	defer dashboards.Close()
+
+	gateway := newGateway(&Client{cfg: testConfigWithDashboards(openSearch, dashboards)}, nil)
+	token, expiresAt, err := gateway.sessions.Create(sessionData{
+		User:       &User{Name: "testuser"},
+		AuthHeader: buildBasicAuthorization("testuser", "dogood"),
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	logoutRecorder := httptest.NewRecorder()
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	logoutRequest.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token, Expires: expiresAt})
+
+	gateway.Handler().ServeHTTP(logoutRecorder, logoutRequest)
+
+	if logoutRecorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected logout redirect, got %d", logoutRecorder.Code)
+	}
+	if _, ok := gateway.sessions.Get(token); ok {
+		t.Fatal("expected session to be deleted")
+	}
+
+	dashboardRecorder := httptest.NewRecorder()
+	dashboardRequest := httptest.NewRequest(http.MethodGet, "/dashboards/app/home", nil)
+	dashboardRequest.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token, Expires: expiresAt})
+
+	gateway.Handler().ServeHTTP(dashboardRecorder, dashboardRequest)
+
+	if dashboardRecorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected status 303 after logout, got %d", dashboardRecorder.Code)
+	}
+	if got := dashboardRecorder.Header().Get("Location"); got != "/login" {
+		t.Fatalf("expected redirect to /login after logout, got %q", got)
+	}
+}
+
+func TestGatewayExpiredSessionRedirectsToLogin(t *testing.T) {
+	t.Parallel()
+
+	gateway := newGateway(&Client{cfg: Config{DashboardsURL: "http://dashboards.example"}}, nil)
+	gateway.sessions.sessions["expired"] = sessionData{
+		User:       &User{Name: "testuser"},
+		AuthHeader: buildBasicAuthorization("testuser", "dogood"),
+		ExpiresAt:  time.Now().Add(-time.Minute),
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/dashboards/app/home", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "expired"})
+
+	gateway.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected status 303, got %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("Location"); got != "/login" {
+		t.Fatalf("expected redirect to /login, got %q", got)
 	}
 }
 
@@ -733,7 +1273,7 @@ func TestGatewayDataViewFailureReturnsBadGateway(t *testing.T) {
 	dashboards := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dashboardsCalls = append(dashboardsCalls, r.Method+" "+r.URL.RequestURI())
 
-		if r.Method != http.MethodPost || r.URL.RequestURI() != "/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true" {
+		if r.Method != http.MethodPost || r.URL.RequestURI() != "/dashboards/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true" {
 			t.Fatalf("unexpected Dashboards request: %s %s", r.Method, r.URL.RequestURI())
 		}
 		http.Error(w, `{"error":"data view create failed"}`, http.StatusInternalServerError)
@@ -755,7 +1295,7 @@ func TestGatewayDataViewFailureReturnsBadGateway(t *testing.T) {
 		t.Fatalf("unexpected OpenSearch sequence: %#v", openSearchCalls)
 	}
 	if !reflect.DeepEqual(dashboardsCalls, []string{
-		"POST /api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true",
+		"POST /dashboards/api/saved_objects/index-pattern/gateway-index-pattern-orders?overwrite=true",
 	}) {
 		t.Fatalf("unexpected Dashboards sequence: %#v", dashboardsCalls)
 	}
@@ -879,7 +1419,11 @@ func testConfigWithDashboards(openSearch, dashboards *httptest.Server) Config {
 }
 
 func testGatewayHandler(cfg Config) http.Handler {
-	return (&Gateway{client: &Client{cfg: cfg}}).Handler()
+	return testGatewayHandlerWithAuth(cfg, nil)
+}
+
+func testGatewayHandlerWithAuth(cfg Config, authenticate ldapAuthenticator) http.Handler {
+	return newGateway(&Client{cfg: cfg}, authenticate).Handler()
 }
 
 func decodeRequestBody(t *testing.T, r *http.Request) map[string]any {

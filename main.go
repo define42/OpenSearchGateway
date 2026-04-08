@@ -3,22 +3,29 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"mime"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -35,6 +42,7 @@ const (
 	backingIndexSeed  = "-000001"
 
 	maxIndexNameBytes = 255
+	sessionCookieName = "opensearchgateway_session"
 )
 
 var (
@@ -62,8 +70,17 @@ type Client struct {
 	ensuredDataViews sync.Map
 }
 
+type ldapAuthenticator func(string, string) (*User, []Access, error)
+
 type Gateway struct {
-	client *Client
+	client       *Client
+	authenticate ldapAuthenticator
+	sessions     *sessionStore
+}
+
+type sessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]sessionData
 }
 
 type ResponseError struct {
@@ -137,9 +154,230 @@ type dashboardsDataViewAttributes struct {
 	TimeFieldName string `json:"timeFieldName"`
 }
 
+type loginPageData struct {
+	Error    string
+	Username string
+}
+
 type tenantRequest struct {
 	Description string `json:"description"`
 }
+
+type securityRoleRequest struct {
+	ClusterPermissions []string                   `json:"cluster_permissions"`
+	IndexPermissions   []securityIndexPermission  `json:"index_permissions"`
+	TenantPermissions  []securityTenantPermission `json:"tenant_permissions"`
+}
+
+type securityIndexPermission struct {
+	IndexPatterns  []string `json:"index_patterns"`
+	AllowedActions []string `json:"allowed_actions"`
+}
+
+type securityTenantPermission struct {
+	TenantPatterns []string `json:"tenant_patterns"`
+	AllowedActions []string `json:"allowed_actions"`
+}
+
+type internalUserRequest struct {
+	Hash                    string            `json:"hash,omitempty"`
+	Password                string            `json:"password,omitempty"`
+	OpenDistroSecurityRoles []string          `json:"opendistro_security_roles"`
+	BackendRoles            []string          `json:"backend_roles,omitempty"`
+	Attributes              map[string]string `json:"attributes,omitempty"`
+}
+
+type securityUserInfo struct {
+	Reserved bool `json:"reserved"`
+	Hidden   bool `json:"hidden"`
+}
+
+var errReservedInternalUser = errors.New("opensearch internal user is reserved or hidden")
+
+var loginPageTemplate = template.Must(template.New("login").Parse(loginPageHTML))
+
+const loginPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenSearch Gateway Login</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef2e7;
+      --panel: rgba(255, 255, 252, 0.94);
+      --ink: #1d261c;
+      --muted: #617062;
+      --accent: #295f4e;
+      --accent-strong: #173e32;
+      --danger: #a23d3d;
+      --border: rgba(47, 71, 56, 0.12);
+      --shadow: 0 24px 80px rgba(39, 69, 54, 0.16);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Avenir Next", "Trebuchet MS", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(41, 95, 78, 0.17), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(187, 209, 176, 0.3), transparent 32%),
+        linear-gradient(160deg, #edf5e8 0%, #fafcf8 52%, #e4ece0 100%);
+      display: grid;
+      place-items: center;
+      padding: 32px 18px;
+    }
+
+    main {
+      width: min(520px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      backdrop-filter: blur(12px);
+    }
+
+    .hero {
+      padding: 32px 32px 18px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.7), rgba(237, 245, 232, 0.92));
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(2rem, 4vw, 3rem);
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    form {
+      padding: 28px 32px 32px;
+      display: grid;
+      gap: 18px;
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 0.96rem;
+    }
+
+    input,
+    button {
+      font: inherit;
+    }
+
+    input {
+      width: 100%;
+      border: 1px solid rgba(47, 71, 56, 0.18);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.92);
+      color: var(--ink);
+      padding: 14px 16px;
+      transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+    }
+
+    input:focus {
+      outline: none;
+      border-color: rgba(41, 95, 78, 0.6);
+      box-shadow: 0 0 0 4px rgba(41, 95, 78, 0.12);
+      transform: translateY(-1px);
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 13px 20px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+      color: #f3fbf7;
+      font-weight: 800;
+      cursor: pointer;
+      box-shadow: 0 16px 36px rgba(23, 62, 50, 0.22);
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 0.93rem;
+      line-height: 1.55;
+    }
+
+    .error {
+      margin: 0;
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: rgba(162, 61, 61, 0.1);
+      color: var(--danger);
+      font-weight: 700;
+    }
+
+    .links {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 700;
+    }
+
+    @media (max-width: 700px) {
+      .hero,
+      form {
+        padding-left: 20px;
+        padding-right: 20px;
+      }
+
+      main {
+        border-radius: 22px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>Gateway Login</h1>
+      <p>Sign in with your LDAP username and password. The gateway validates the credentials, provisions your OpenSearch account, and then opens OpenSearch Dashboards through the gateway proxy.</p>
+    </section>
+
+    <form method="post" action="/login">
+      {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" value="{{.Username}}" autocomplete="username" spellcheck="false" required>
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+
+      <button type="submit">Sign In</button>
+
+      <div class="links">
+        <span class="hint">Dashboards is proxied through this gateway after sign-in.</span>
+        <a href="/demo">Open demo page</a>
+      </div>
+    </form>
+  </main>
+</body>
+</html>
+`
 
 const demoPageHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -434,7 +672,21 @@ func run(ctx context.Context, cfg Config, serve func(http.Handler) error) error 
 		return err
 	}
 
-	return serve((&Gateway{client: client}).Handler())
+	return serve(newGateway(client, ldapAuthenticateAccess).Handler())
+}
+
+func newGateway(client *Client, authenticate ldapAuthenticator) *Gateway {
+	if authenticate == nil {
+		authenticate = ldapAuthenticateAccess
+	}
+
+	return &Gateway{
+		client:       client,
+		authenticate: authenticate,
+		sessions: &sessionStore{
+			sessions: make(map[string]sessionData),
+		},
+	}
 }
 
 func defaultHTTPClient() *http.Client {
@@ -493,10 +745,98 @@ func (c *Client) EnsureIndexTemplate(ctx context.Context, templateName string) e
 
 func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", g.handleRoot)
+	mux.HandleFunc("/login", g.handleLogin)
+	mux.HandleFunc("/logout", g.handleLogout)
+	mux.HandleFunc("/dashboards", g.handleDashboards)
+	mux.HandleFunc("/dashboards/", g.handleDashboards)
 	mux.HandleFunc("/demo", g.handleDemo)
 	mux.HandleFunc("/ingest", g.handleIngest)
 	mux.HandleFunc("/ingest/", g.handleIngest)
 	return mux
+}
+
+func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodHead)
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/login" {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		if _, session, ok := g.currentSession(r); ok && session.ExpiresAt.After(time.Now()) {
+			http.Redirect(w, r, "/dashboards/", http.StatusSeeOther)
+			return
+		}
+		g.renderLoginPage(w, http.StatusOK, loginPageData{})
+	case http.MethodPost:
+		g.handleLoginSubmit(w, r)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (g *Gateway) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/logout" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if token, _, ok := g.currentSession(r); ok {
+		g.sessions.Delete(token)
+	} else if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		g.sessions.Delete(cookie.Value)
+	}
+
+	g.clearSessionCookie(w, r)
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+func (g *Gateway) handleDashboards(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/dashboards" && !strings.HasPrefix(r.URL.Path, "/dashboards/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	token, session, ok := g.currentSession(r)
+	if !ok {
+		g.clearSessionCookie(w, r)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	session, ok = g.sessions.Touch(token)
+	if !ok {
+		g.clearSessionCookie(w, r)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	g.setSessionCookie(w, r, token, session.ExpiresAt)
+	if err := g.proxyDashboards(w, r, session); err != nil {
+		writeErrorJSON(w, http.StatusBadGateway, fmt.Sprintf("Dashboards proxy failed: %v", err))
+	}
 }
 
 func (g *Gateway) handleDemo(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +852,68 @@ func (g *Gateway) handleDemo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	serveDemoPage(w)
+}
+
+func (g *Gateway) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		g.renderLoginPage(w, http.StatusBadGateway, loginPageData{Error: "failed to read login form"})
+		return
+	}
+
+	username := strings.TrimSpace(r.Form.Get("username"))
+	password := r.Form.Get("password")
+	if username == "" || password == "" {
+		g.renderLoginPage(w, http.StatusUnauthorized, loginPageData{
+			Error:    "username and password are required",
+			Username: username,
+		})
+		return
+	}
+
+	user, access, err := g.authenticate(username, password)
+	if err != nil {
+		status, message := loginErrorResponse(err)
+		g.renderLoginPage(w, status, loginPageData{
+			Error:    message,
+			Username: username,
+		})
+		return
+	}
+
+	namespaces, err := g.client.ProvisionLoginUser(r.Context(), username, password, access)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, errReservedInternalUser) {
+			status = http.StatusForbidden
+		}
+		g.renderLoginPage(w, status, loginPageData{
+			Error:    err.Error(),
+			Username: username,
+		})
+		return
+	}
+
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		g.sessions.Delete(cookie.Value)
+	}
+
+	token, expiresAt, err := g.sessions.Create(sessionData{
+		User:       user,
+		Access:     access,
+		Namespaces: namespaces,
+		AuthHeader: buildBasicAuthorization(username, password),
+		CreatedAt:  time.Now(),
+	})
+	if err != nil {
+		g.renderLoginPage(w, http.StatusBadGateway, loginPageData{
+			Error:    "failed to create login session",
+			Username: username,
+		})
+		return
+	}
+
+	g.setSessionCookie(w, r, token, expiresAt)
+	http.Redirect(w, r, "/dashboards/", http.StatusSeeOther)
 }
 
 func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
@@ -581,6 +983,101 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 		DocumentID:   indexed.ID,
 		Bootstrapped: bootstrapped,
 	})
+}
+
+func (g *Gateway) renderLoginPage(w http.ResponseWriter, status int, data loginPageData) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	if err := loginPageTemplate.Execute(w, data); err != nil {
+		http.Error(w, "failed to render login page", http.StatusInternalServerError)
+	}
+}
+
+func loginErrorResponse(err error) (int, string) {
+	switch {
+	case errors.Is(err, errLDAPInvalidCredentials), errors.Is(err, errLDAPUserNotFound):
+		return http.StatusUnauthorized, "invalid username or password"
+	case errors.Is(err, errLDAPUnauthorized):
+		return http.StatusForbidden, "your LDAP account does not grant access to OpenSearch Dashboards"
+	default:
+		return http.StatusBadGateway, fmt.Sprintf("LDAP authentication failed: %v", err)
+	}
+}
+
+func (g *Gateway) currentSession(r *http.Request) (string, sessionData, bool) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return "", sessionData{}, false
+	}
+
+	session, ok := g.sessions.Get(cookie.Value)
+	if !ok {
+		return cookie.Value, sessionData{}, false
+	}
+	return cookie.Value, session, true
+}
+
+func (g *Gateway) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expiresAt time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+		Expires:  expiresAt,
+		MaxAge:   int(time.Until(expiresAt).Seconds()),
+	})
+}
+
+func (g *Gateway) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
+}
+
+func (g *Gateway) proxyDashboards(w http.ResponseWriter, r *http.Request, session sessionData) error {
+	target, err := url.Parse(g.client.cfg.DashboardsURL)
+	if err != nil {
+		return fmt.Errorf("invalid Dashboards URL: %w", err)
+	}
+
+	defaultTenant := sessionDefaultTenant(session)
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalHost := req.Host
+		originalDirector(req)
+		req.Host = target.Host
+		req.Header.Del("Authorization")
+		req.Header.Set("Authorization", session.AuthHeader)
+		if req.Header.Get("securitytenant") == "" && defaultTenant != "" {
+			req.Header.Set("securitytenant", defaultTenant)
+		}
+		req.Header.Set("X-Forwarded-Host", originalHost)
+		req.Header.Set("X-Forwarded-Proto", forwardedProto(r))
+	}
+	proxy.ErrorHandler = func(proxyWriter http.ResponseWriter, proxyRequest *http.Request, proxyErr error) {
+		writeErrorJSON(proxyWriter, http.StatusBadGateway, fmt.Sprintf("Dashboards proxy failed: %v", proxyErr))
+	}
+
+	proxy.ServeHTTP(w, r)
+	return nil
+}
+
+func sessionDefaultTenant(session sessionData) string {
+	if len(session.Namespaces) != 1 {
+		return ""
+	}
+	return strings.TrimSpace(session.Namespaces[0])
 }
 
 func parseIngestPath(path string) (string, error) {
@@ -696,6 +1193,99 @@ func (c *Client) IndexDocument(ctx context.Context, alias string, document map[s
 		return indexDocumentResponse{}, err
 	}
 	return response, nil
+}
+
+func (c *Client) ProvisionLoginUser(ctx context.Context, username, password string, access []Access) ([]string, error) {
+	effective := normalizeAccessByNamespace(access)
+	if len(effective) == 0 {
+		return nil, fmt.Errorf("no LDAP namespaces available for %s", username)
+	}
+
+	if err := c.ensureInternalUserWritable(ctx, username); err != nil {
+		return nil, err
+	}
+
+	roleNames := make([]string, 0, len(effective)+1)
+	namespaces := make([]string, 0, len(effective))
+	for _, item := range effective {
+		if !indexNamePattern.MatchString(item.Namespace) {
+			return nil, fmt.Errorf("LDAP namespace %q cannot be mapped to OpenSearch resources", item.Namespace)
+		}
+
+		roleName := buildGatewayRoleName(item.Namespace, roleModeForAccess(item))
+		if err := c.EnsureSecurityRole(ctx, roleName, item); err != nil {
+			return nil, err
+		}
+		if err := c.EnsureDashboardDataView(ctx, item.Namespace); err != nil {
+			return nil, err
+		}
+
+		roleNames = append(roleNames, roleName)
+		namespaces = append(namespaces, item.Namespace)
+	}
+
+	sort.Strings(roleNames)
+	sort.Strings(namespaces)
+	roleNames = append([]string{"kibana_user"}, roleNames...)
+
+	if err := c.UpsertInternalUser(ctx, username, password, roleNames, accessGroupNames(access), namespaces); err != nil {
+		return nil, err
+	}
+
+	return namespaces, nil
+}
+
+func (c *Client) ensureInternalUserWritable(ctx context.Context, username string) error {
+	path := "/_plugins/_security/api/internalusers/" + url.PathEscape(username)
+
+	var response map[string]securityUserInfo
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &response, []int{http.StatusOK})
+	if err != nil {
+		if isNotFoundResponse(err) {
+			return nil
+		}
+		return err
+	}
+
+	info, ok := response[username]
+	if !ok {
+		return nil
+	}
+	if info.Reserved || info.Hidden {
+		return fmt.Errorf("%w: %s", errReservedInternalUser, username)
+	}
+	return nil
+}
+
+func (c *Client) EnsureSecurityRole(ctx context.Context, roleName string, access Access) error {
+	path := "/_plugins/_security/api/roles/" + url.PathEscape(roleName)
+	body := roleRequestForAccess(access)
+	if err := c.doJSON(ctx, http.MethodPut, path, body, nil, []int{http.StatusOK, http.StatusCreated}); err != nil {
+		return fmt.Errorf("ensure security role %q: %w", roleName, err)
+	}
+	return nil
+}
+
+func (c *Client) UpsertInternalUser(ctx context.Context, username, password string, roleNames, backendRoles, namespaces []string) error {
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("hash OpenSearch password for %q: %w", username, err)
+	}
+
+	body := internalUserRequest{
+		Hash:                    string(passwordHash),
+		OpenDistroSecurityRoles: roleNames,
+		BackendRoles:            backendRoles,
+		Attributes: map[string]string{
+			"namespaces": strings.Join(namespaces, ","),
+		},
+	}
+
+	path := "/_plugins/_security/api/internalusers/" + url.PathEscape(username)
+	if err := c.doJSON(ctx, http.MethodPut, path, body, nil, []int{http.StatusOK, http.StatusCreated}); err != nil {
+		return fmt.Errorf("upsert OpenSearch user %q: %w", username, err)
+	}
+	return nil
 }
 
 func (c *Client) EnsureTenant(ctx context.Context, tenantName string) error {
@@ -881,7 +1471,7 @@ func (c *Client) newDashboardsRequestForTenant(ctx context.Context, tenantName, 
 		headers["securitytenant"] = tenantName
 	}
 
-	return c.newRequestForBase(ctx, c.cfg.DashboardsURL, method, path, body, c.cfg.DashboardsUsername, c.cfg.DashboardsPassword, headers)
+	return c.newRequestForBase(ctx, c.cfg.DashboardsURL, method, dashboardsAPIPath(path), body, c.cfg.DashboardsUsername, c.cfg.DashboardsPassword, headers)
 }
 
 func (c *Client) newRequestForBase(ctx context.Context, baseURL, method, path string, body io.Reader, username, password string, headers map[string]string) (*http.Request, error) {
@@ -945,6 +1535,211 @@ func buildDataViewID(indexName string) string {
 
 func buildDataViewPattern(indexName string) string {
 	return indexName + "-*"
+}
+
+func dashboardsAPIPath(path string) string {
+	if path == "/dashboards" || strings.HasPrefix(path, "/dashboards/") {
+		return path
+	}
+	if strings.HasPrefix(path, "/") {
+		return "/dashboards" + path
+	}
+	return "/dashboards/" + path
+}
+
+func normalizeAccessByNamespace(access []Access) []Access {
+	combined := make(map[string]Access)
+
+	for _, item := range access {
+		existing, ok := combined[item.Namespace]
+		if !ok {
+			combined[item.Namespace] = item
+			continue
+		}
+
+		existing.PullOnly = existing.PullOnly && item.PullOnly
+		existing.DeleteAllowed = existing.DeleteAllowed || item.DeleteAllowed
+		if existing.Group == "" {
+			existing.Group = item.Group
+		}
+		combined[item.Namespace] = existing
+	}
+
+	namespaces := make([]string, 0, len(combined))
+	for namespace := range combined {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+
+	result := make([]Access, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		result = append(result, combined[namespace])
+	}
+	return result
+}
+
+func accessGroupNames(access []Access) []string {
+	seen := make(map[string]struct{})
+	groups := make([]string, 0, len(access))
+	for _, item := range access {
+		if item.Group == "" {
+			continue
+		}
+		if _, ok := seen[item.Group]; ok {
+			continue
+		}
+		seen[item.Group] = struct{}{}
+		groups = append(groups, item.Group)
+	}
+	sort.Strings(groups)
+	return groups
+}
+
+func roleModeForAccess(access Access) string {
+	switch {
+	case !access.PullOnly && access.DeleteAllowed:
+		return "rwd"
+	case !access.PullOnly:
+		return "rw"
+	case access.DeleteAllowed:
+		return "rd"
+	default:
+		return "r"
+	}
+}
+
+func buildGatewayRoleName(namespace, mode string) string {
+	return "gateway_" + namespace + "_" + mode
+}
+
+func roleRequestForAccess(access Access) securityRoleRequest {
+	mode := roleModeForAccess(access)
+
+	clusterPermissions := []string{"cluster_composite_ops_ro", "indices_monitor"}
+	if mode == "rw" || mode == "rwd" {
+		clusterPermissions = []string{"cluster_composite_ops", "indices_monitor"}
+	}
+
+	tenantAction := "kibana_all_read"
+	if mode == "rw" || mode == "rwd" {
+		tenantAction = "kibana_all_write"
+	}
+
+	return securityRoleRequest{
+		ClusterPermissions: clusterPermissions,
+		IndexPermissions: []securityIndexPermission{
+			{
+				IndexPatterns:  []string{buildDataViewPattern(access.Namespace)},
+				AllowedActions: allowedActionsForAccess(mode),
+			},
+		},
+		TenantPermissions: []securityTenantPermission{
+			{
+				TenantPatterns: []string{access.Namespace},
+				AllowedActions: []string{tenantAction},
+			},
+		},
+	}
+}
+
+func allowedActionsForAccess(mode string) []string {
+	switch mode {
+	case "rwd":
+		return []string{"crud"}
+	case "rw":
+		return []string{"read", "write"}
+	case "rd":
+		return []string{"read", "delete"}
+	default:
+		return []string{"read"}
+	}
+}
+
+func (s *sessionStore) Create(data sessionData) (string, time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.sessions == nil {
+		s.sessions = make(map[string]sessionData)
+	}
+
+	now := time.Now()
+	expiresAt := now.Add(sessionTTL)
+	data.CreatedAt = now
+	data.ExpiresAt = expiresAt
+
+	for attempt := 0; attempt < 5; attempt++ {
+		token, err := randomToken()
+		if err != nil {
+			return "", time.Time{}, err
+		}
+		if _, exists := s.sessions[token]; exists {
+			continue
+		}
+		s.sessions[token] = data
+		return token, expiresAt, nil
+	}
+
+	return "", time.Time{}, errors.New("failed to allocate unique session token")
+}
+
+func (s *sessionStore) Get(token string) (sessionData, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, ok := s.sessions[token]
+	if !ok {
+		return sessionData{}, false
+	}
+	if time.Now().After(session.ExpiresAt) {
+		delete(s.sessions, token)
+		return sessionData{}, false
+	}
+	return session, true
+}
+
+func (s *sessionStore) Touch(token string) (sessionData, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, ok := s.sessions[token]
+	if !ok {
+		return sessionData{}, false
+	}
+	if time.Now().After(session.ExpiresAt) {
+		delete(s.sessions, token)
+		return sessionData{}, false
+	}
+
+	session.ExpiresAt = time.Now().Add(sessionTTL)
+	s.sessions[token] = session
+	return session, true
+}
+
+func (s *sessionStore) Delete(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, token)
+}
+
+func randomToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func buildBasicAuthorization(username, password string) string {
+	token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	return "Basic " + token
+}
+
+func forwardedProto(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

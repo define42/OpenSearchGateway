@@ -39,13 +39,8 @@ services:
     depends_on:
       opensearch:
         condition: service_healthy
-    environment:
-      OPENSEARCH_HOSTS: '["https://opensearch:9200"]'
-      OPENSEARCH_SSL_VERIFICATIONMODE: none
-      OPENSEARCH_USERNAME: kibanaserver
-      OPENSEARCH_PASSWORD: kibanaserver
-      SERVER_HOST: 0.0.0.0
-      SERVER_SSL_ENABLED: "false"
+    volumes:
+      - ./opensearch_dashboards.yml:/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml:ro
     ports:
       - "5601:5601"
     networks:
@@ -60,6 +55,10 @@ services:
     depends_on:
       opensearch:
         condition: service_healthy
+      opensearch-dashboards:
+        condition: service_started
+      ldap:
+        condition: service_started
     environment:
       OPENSEARCH_URL: https://opensearch:9200
       OPENSEARCH_USERNAME: admin

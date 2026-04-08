@@ -1,6 +1,9 @@
 # OpenSearchGateway
 
-OpenSearchGateway is a small Go web server that sits in front of an OpenSearch cluster and turns simple JSON HTTP writes into rollover-friendly OpenSearch documents.
+OpenSearchGateway is a small Go web server that sits in front of an OpenSearch cluster and does two jobs:
+
+- it turns simple JSON HTTP writes into rollover-friendly OpenSearch documents
+- it fronts OpenSearch Dashboards with an LDAP-backed login flow and per-user OpenSearch provisioning
 
 It is designed for a very specific ingestion model:
 
@@ -9,8 +12,9 @@ It is designed for a very specific ingestion model:
 - the gateway derives a daily write alias from that timestamp
 - OpenSearch writes go through rollover aliases and backing indices
 - OpenSearch Dashboards gets a per-index tenant and a matching data view automatically
+- LDAP users can sign in through the gateway and reach Dashboards without exposing the admin account
 
-In short, this project gives you a thin HTTP ingest layer in front of OpenSearch, with just enough bootstrap logic to make daily rollover-based indexing and Dashboards discovery work without manual setup for each new index family.
+In short, this project gives you a thin HTTP ingest layer and a thin web access layer in front of OpenSearch, with just enough bootstrap logic to make daily rollover-based indexing, tenant-aware Dashboards discovery, and LDAP-backed Dashboards access work without manual setup for each new index family.
 
 ## What It Does
 
@@ -19,6 +23,16 @@ When the gateway starts, it bootstraps shared cluster resources:
 - ensures the ISM policy `generic-rollover-100m` exists
 - ensures a shared index template exists for rollover backing indices
 - starts an HTTP server on `LISTEN_ADDR` (default `:8080`)
+
+When a user signs in through `POST /login`, the gateway:
+
+1. validates the submitted username and password against LDAP
+2. derives namespace access from LDAP groups like `<namespace>_r`, `<namespace>_rw`, and `<namespace>_rwd`
+3. ensures a matching OpenSearch Security role for each namespace
+4. ensures a tenant and data view exist for each namespace
+5. creates or replaces the internal OpenSearch user with the same username and password semantics
+6. stores a short-lived server-side session
+7. reverse proxies OpenSearch Dashboards under `/dashboards` using the logged-in user's basic auth
 
 When a client sends a document to `POST /ingest/<index>`, the gateway:
 
@@ -58,11 +72,41 @@ This gateway is useful when you want:
 - deterministic daily alias naming based on an event timestamp
 - rollover-compatible index creation
 - automatic Dashboards setup for each logical index family
+- LDAP-backed sign-in for Dashboards without giving end users the admin credential
+- namespace-scoped OpenSearch users and Dashboards tenants derived from LDAP groups
 - a lightweight developer stack you can run locally with Docker Compose
 
 It is especially handy for internal tools, demos, prototypes, and ingestion pipelines where producers should not need to know OpenSearch index template, alias, tenant, or Dashboards setup details.
 
 ## HTTP Interface
+
+### `GET /`
+
+Redirects to `/login`.
+
+### `GET /login`
+
+Serves the gateway login page.
+
+### `POST /login`
+
+Authenticates the submitted LDAP credentials, provisions the user's OpenSearch roles and internal user, creates a gateway session, and redirects to `/dashboards/` on success.
+
+Login responses:
+
+- `303` on success
+- `401` for invalid username or password
+- `403` when LDAP auth succeeds but no authorized namespace groups are present, or when the target OpenSearch internal user is reserved/hidden
+- `502` when LDAP, OpenSearch Security API, or Dashboards provisioning fails
+
+### `POST /logout`
+
+Clears the gateway session and redirects back to `/login`.
+
+### `GET /dashboards`
+### `GET /dashboards/*`
+
+Reverse proxies OpenSearch Dashboards through the gateway. These routes require a valid gateway session. The gateway injects the logged-in user's basic auth header on proxied requests and refreshes the session idle timeout while Dashboards is in use.
 
 ### `GET /demo`
 
@@ -171,25 +215,28 @@ the gateway produces:
 
 Writes always go through the alias, not directly to the backing index.
 
-## Dashboards Behavior
+## Dashboards And LDAP Behavior
 
 For every new index family, the gateway creates:
 
 - an OpenSearch Security tenant named exactly after the index family
 - an OpenSearch Dashboards data view inside that tenant
 
+For every successful LDAP login, the gateway also:
+
+- derives namespace access from LDAP group names
+- ensures one custom OpenSearch role per effective namespace access mode
+- creates or replaces the corresponding internal OpenSearch user
+- grants the built-in `kibana_user` role plus the namespace roles
+
 That means:
 
 - `orders` data goes with the `orders` tenant
 - the Dashboards data view is created with title `orders-*`
 - the time field is set to `event_time`
+- a user with LDAP groups `team1_rwd` and `team2_rw` gets roles that map to `team1-*` and `team2-*`
 
 This keeps data-view organization aligned with the ingest namespace.
-
-Current behavior is admin-focused:
-
-- the gateway creates tenants and data views using the configured admin credentials
-- it does not create roles or role mappings for non-admin users
 
 ## Local Development Stack
 
@@ -198,6 +245,7 @@ The repository includes a full local stack in [docker-compose.yml](/home/define4
 - OpenSearch
 - OpenSearch Dashboards
 - OpenSearchGateway
+- GLAuth LDAP
 
 ### Start the stack
 
@@ -216,6 +264,7 @@ The compose stack exposes:
 - OpenSearch: `https://localhost:9200`
 - OpenSearch Dashboards: `http://localhost:5601`
 - OpenSearchGateway: `http://localhost:8080`
+- LDAP: `ldaps://localhost:389`
 
 Default admin password in the local stack:
 
@@ -229,6 +278,21 @@ You can override it with:
 export OPENSEARCH_ADMIN_PASSWORD='your-strong-password'
 docker compose up --build
 ```
+
+The bundled LDAP config includes a demo user you can use against the gateway login page:
+
+```text
+username: testuser
+password: dogood
+```
+
+That user resolves to these namespace groups in the sample LDAP config:
+
+- `team1_rwd`
+- `team2_rw`
+- `team10_r`
+
+So after login, the gateway provisions access for `team1-*`, `team2-*`, and `team10-*`.
 
 ## Running the Gateway Without Docker
 
@@ -248,6 +312,14 @@ Useful environment variables:
 - `DASHBOARDS_USERNAME`
 - `DASHBOARDS_PASSWORD`
 - `DASHBOARDS_TENANT`
+- `LDAP_URL`
+- `LDAP_BASE_DN`
+- `LDAP_USER_FILTER`
+- `LDAP_GROUP_ATTRIBUTE`
+- `LDAP_GROUP_PREFIX`
+- `LDAP_USER_DOMAIN`
+- `LDAP_STARTTLS`
+- `LDAP_SKIP_TLS_VERIFY`
 
 Current defaults in the code:
 
@@ -257,6 +329,16 @@ Current defaults in the code:
 - username defaults to `admin`
 
 Note that per-index data views are created in tenants named after the index, so `DASHBOARDS_TENANT` is not used for those auto-created views. It remains available as the default tenant value for generic Dashboards requests.
+
+## Route Summary
+
+- `GET /` redirects to `/login`
+- `GET /login` renders the login form
+- `POST /login` authenticates against LDAP and opens a Dashboards session
+- `POST /logout` clears the session
+- `GET /dashboards/*` proxies OpenSearch Dashboards for authenticated users
+- `GET /demo` serves the browser demo ingest form
+- `POST /ingest/<index>` ingests a JSON document into the rollover alias for that index family
 
 ## Example Ingest
 
