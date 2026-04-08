@@ -279,6 +279,44 @@ func TestLDAPJohndoeCannotIngestTeam10(t *testing.T) {
 	}
 }
 
+func TestLDAPAuthenticateAccessErrorScenarios(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Docker-backed LDAP integration test in short mode")
+	}
+	requireDocker(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	ldapURL, stopLDAP := startDockerGlauth(ctx, t)
+	defer stopLDAP()
+
+	t.Setenv("LDAP_URL", ldapURL)
+	t.Setenv("LDAP_SKIP_TLS_VERIFY", "true")
+	t.Setenv("LDAP_STARTTLS", "false")
+	t.Setenv("LDAP_USER_DOMAIN", "@example.com")
+
+	prevCfg := ldapCfg
+	ldapCfg = loadLDAPConfig()
+	t.Cleanup(func() {
+		ldapCfg = prevCfg
+	})
+
+	t.Run("invalid credentials", func(t *testing.T) {
+		user, access, err := ldapAuthenticateAccess("johndoe", "wrongpass")
+		if !errors.Is(err, errLDAPInvalidCredentials) {
+			t.Fatalf("expected invalid credentials error, got user=%+v access=%+v err=%v", user, access, err)
+		}
+	})
+
+	t.Run("unauthorized groups", func(t *testing.T) {
+		user, access, err := ldapAuthenticateAccess("serviceuser", "mysecret")
+		if !errors.Is(err, errLDAPUnauthorized) {
+			t.Fatalf("expected unauthorized error, got user=%+v access=%+v err=%v", user, access, err)
+		}
+	})
+}
+
 func requireDocker(t *testing.T) {
 	t.Helper()
 
