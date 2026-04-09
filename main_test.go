@@ -1229,7 +1229,10 @@ func TestGatewayIngestUsesAuthenticatedSessionAccess(t *testing.T) {
 	}))
 	defer openSearch.Close()
 
-	gateway := newGateway(&Client{cfg: testConfig(openSearch)}, defaultTestLDAPAuthenticator)
+	gateway := newGateway(&Client{cfg: testConfig(openSearch)}, func(username, password string) (*User, []Access, error) {
+		t.Fatalf("session-backed ingest should not call LDAP authenticate")
+		return nil, nil, nil
+	})
 	token, expiresAt, err := gateway.sessions.Create(sessionData{
 		User:       &User{Name: "ingestuser", Namespace: "team10"},
 		Access:     []Access{{Group: "team10_rw", Namespace: "team10"}},

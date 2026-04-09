@@ -2,7 +2,10 @@ package main
 
 import "time"
 
-const sessionTTL = 30 * time.Minute
+const (
+	sessionTTL         = 30 * time.Minute
+	ingestAuthCacheTTL = 5 * time.Minute
+)
 
 type sessionData struct {
 	User       *User

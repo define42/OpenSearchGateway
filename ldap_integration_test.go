@@ -43,6 +43,8 @@ func TestLDAPIngestUserCanIngestTeam10(t *testing.T) {
 	var mu sync.Mutex
 	var openSearchCalls []string
 	var indexedDocument map[string]any
+	aliasChecks := 0
+	indexedDocuments := 0
 
 	openSearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -64,7 +66,12 @@ func TestLDAPIngestUserCanIngestTeam10(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 			_, _ = io.WriteString(w, `{}`)
 		case "HEAD /_alias/team10-20241230-rollover":
-			w.WriteHeader(http.StatusNotFound)
+			if aliasChecks == 0 {
+				w.WriteHeader(http.StatusNotFound)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+			aliasChecks++
 		case "PUT /team10-20241230-rollover-000001":
 			w.WriteHeader(http.StatusCreated)
 			_, _ = io.WriteString(w, `{}`)
@@ -73,6 +80,7 @@ func TestLDAPIngestUserCanIngestTeam10(t *testing.T) {
 			_, _ = io.WriteString(w, `{}`)
 		case "POST /team10-20241230-rollover/_doc":
 			indexedDocument = decodeRequestBody(t, r)
+			indexedDocuments++
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"result":"created","_id":"ldap-team10-doc"}`)
 		default:
@@ -118,49 +126,61 @@ func TestLDAPIngestUserCanIngestTeam10(t *testing.T) {
 		HTTPClient:         &http.Client{Timeout: 10 * time.Second},
 	}
 
-	baseURL, stopGateway := startIntegrationGateway(ctx, t, cfg)
+	baseURL, gateway, stopGateway := startIntegrationGateway(ctx, t, cfg)
 	defer stopGateway()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/ingest/team10", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"ldap ingest integration"}`))
-	if err != nil {
-		t.Fatalf("build ingest request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth("ingestuser", "dogood")
+	responses := make([]ingestResponse, 0, 2)
+	messages := []string{"ldap ingest integration", "ldap ingest cached"}
+	for _, message := range messages {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/ingest/team10", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"`+message+`"}`))
+		if err != nil {
+			t.Fatalf("build ingest request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.SetBasicAuth("ingestuser", "dogood")
 
-	resp, err := cfg.HTTPClient.Do(req)
-	if err != nil {
-		t.Fatalf("send ingest request: %v", err)
-	}
-	defer resp.Body.Close()
+		resp, err := cfg.HTTPClient.Do(req)
+		if err != nil {
+			t.Fatalf("send ingest request: %v", err)
+		}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read ingest response: %v", err)
-	}
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("expected status 201, got %d: %s", resp.StatusCode, string(body))
-	}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("read ingest response: %v", err)
+		}
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("expected status 201, got %d: %s", resp.StatusCode, string(body))
+		}
 
-	var response ingestResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		t.Fatalf("decode ingest response: %v", err)
-	}
-	if response.WriteAlias != "team10-20241230-rollover" {
-		t.Fatalf("unexpected write alias: %#v", response)
-	}
-	if response.DocumentID != "ldap-team10-doc" || response.Result != "created" {
-		t.Fatalf("unexpected ingest response: %#v", response)
-	}
-	if !response.Bootstrapped {
-		t.Fatalf("expected first write to bootstrap alias, got %#v", response)
+		var response ingestResponse
+		if err := json.Unmarshal(body, &response); err != nil {
+			t.Fatalf("decode ingest response: %v", err)
+		}
+		responses = append(responses, response)
 	}
 
-	if got := indexedDocument["message"]; got != "ldap ingest integration" {
+	if responses[0].WriteAlias != "team10-20241230-rollover" || responses[1].WriteAlias != "team10-20241230-rollover" {
+		t.Fatalf("unexpected write aliases: %#v", responses)
+	}
+	if responses[0].DocumentID != "ldap-team10-doc" || responses[0].Result != "created" || !responses[0].Bootstrapped {
+		t.Fatalf("unexpected first ingest response: %#v", responses[0])
+	}
+	if responses[1].DocumentID != "ldap-team10-doc" || responses[1].Result != "created" || responses[1].Bootstrapped {
+		t.Fatalf("unexpected second ingest response: %#v", responses[1])
+	}
+
+	if got := indexedDocument["message"]; got != "ldap ingest cached" {
 		t.Fatalf("unexpected indexed message: %#v", indexedDocument)
 	}
 	if got := indexedDocument["event_time"]; got != "2024-12-30T10:11:12Z" {
 		t.Fatalf("unexpected indexed event_time: %#v", indexedDocument)
+	}
+	if aliasChecks != 2 {
+		t.Fatalf("expected two alias checks, got %d", aliasChecks)
+	}
+	if indexedDocuments != 2 {
+		t.Fatalf("expected two indexed documents, got %d", indexedDocuments)
 	}
 
 	if !containsCall(openSearchCalls, "POST /team10-20241230-rollover/_doc") {
@@ -168,6 +188,14 @@ func TestLDAPIngestUserCanIngestTeam10(t *testing.T) {
 	}
 	if !containsCall(dashboardsCalls, "POST /dashboards/api/saved_objects/index-pattern/gateway-index-pattern-team10?overwrite=true") {
 		t.Fatalf("expected Dashboards data view creation, got %#v", dashboardsCalls)
+	}
+	if len(dashboardsCalls) != 2 {
+		t.Fatalf("expected tenant-scoped Dashboards setup only once, got %#v", dashboardsCalls)
+	}
+
+	stats := gateway.ingestAuthCache.Stats()
+	if stats.Hits != 1 || stats.Misses != 1 || stats.Expired != 0 || stats.Entries != 1 {
+		t.Fatalf("unexpected ingest auth cache stats: %+v", stats)
 	}
 }
 
@@ -236,7 +264,7 @@ func TestLDAPJohndoeCannotIngestTeam10(t *testing.T) {
 		HTTPClient:         &http.Client{Timeout: 10 * time.Second},
 	}
 
-	baseURL, stopGateway := startIntegrationGateway(ctx, t, cfg)
+	baseURL, _, stopGateway := startIntegrationGateway(ctx, t, cfg)
 	defer stopGateway()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/ingest/team10", strings.NewReader(`{"event_time":"2024-12-30T10:11:12Z","message":"should be forbidden"}`))
@@ -417,7 +445,7 @@ func waitForLDAPReady(ctx context.Context, t *testing.T, ldapURL string) {
 	t.Fatalf("LDAP did not become ready in time")
 }
 
-func startIntegrationGateway(ctx context.Context, t *testing.T, cfg Config) (string, func()) {
+func startIntegrationGateway(ctx context.Context, t *testing.T, cfg Config) (string, *Gateway, func()) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -426,29 +454,35 @@ func startIntegrationGateway(ctx context.Context, t *testing.T, cfg Config) (str
 	}
 
 	baseURL := "http://" + listener.Addr().String()
+	client := &Client{cfg: cfg}
+	if err := client.EnsureISMPolicy(ctx, ismPolicyID, 100000000); err != nil {
+		t.Fatalf("bootstrap ISM policy: %v", err)
+	}
+	if err := client.EnsureIndexTemplate(ctx, indexTemplateName); err != nil {
+		t.Fatalf("bootstrap index template: %v", err)
+	}
+	gateway := newGateway(client, ldapAuthenticateAccess)
 	runCtx, cancel := context.WithCancel(ctx)
 	errCh := make(chan error, 1)
 
 	go func() {
-		errCh <- run(runCtx, cfg, func(handler http.Handler) error {
-			srv := &http.Server{
-				Handler:           handler,
-				ReadHeaderTimeout: 5 * time.Second,
-			}
+		srv := &http.Server{
+			Handler:           gateway.Handler(),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
 
-			go func() {
-				<-runCtx.Done()
-				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer shutdownCancel()
-				_ = srv.Shutdown(shutdownCtx)
-			}()
+		go func() {
+			<-runCtx.Done()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
 
-			err := srv.Serve(listener)
-			if errors.Is(err, http.ErrServerClosed) {
-				return nil
-			}
-			return err
-		})
+		err := srv.Serve(listener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		errCh <- err
 	}()
 
 	waitForGatewayReady(ctx, t, cfg.HTTPClient, baseURL)
@@ -465,7 +499,7 @@ func startIntegrationGateway(ctx context.Context, t *testing.T, cfg Config) (str
 		}
 	}
 
-	return baseURL, cleanup
+	return baseURL, gateway, cleanup
 }
 
 func waitForGatewayReady(ctx context.Context, t *testing.T, client *http.Client, baseURL string) {

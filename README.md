@@ -135,6 +135,8 @@ This endpoint now requires authentication. The gateway accepts either:
 - HTTP Basic auth with an LDAP username and password
 - an existing gateway session cookie created by `POST /login`
 
+For repeated Basic-authenticated ingest requests, the gateway keeps a process-local in-memory cache of successful LDAP auth results for 5 minutes. Active callers refresh that TTL on cache hits, while session-backed ingest continues to skip LDAP entirely.
+
 Accepted path examples:
 
 ```text

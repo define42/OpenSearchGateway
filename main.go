@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -76,14 +77,44 @@ type Client struct {
 type ldapAuthenticator func(string, string) (*User, []Access, error)
 
 type Gateway struct {
-	client       *Client
-	authenticate ldapAuthenticator
-	sessions     *sessionStore
+	client          *Client
+	authenticate    ldapAuthenticator
+	sessions        *sessionStore
+	ingestAuthCache *ingestAuthCache
 }
 
 type sessionStore struct {
 	mu       sync.Mutex
 	sessions map[string]sessionData
+}
+
+type ingestAuthCache struct {
+	mu       sync.Mutex
+	now      func() time.Time
+	entries  map[string]ingestAuthCacheEntry
+	inflight map[string]*ingestAuthCacheCall
+	hits     uint64
+	misses   uint64
+	expired  uint64
+}
+
+type ingestAuthCacheEntry struct {
+	Username  string
+	Access    []Access
+	ExpiresAt time.Time
+}
+
+type ingestAuthCacheCall struct {
+	done  chan struct{}
+	entry ingestAuthCacheEntry
+	err   error
+}
+
+type ingestAuthCacheStats struct {
+	Hits    uint64
+	Misses  uint64
+	Expired uint64
+	Entries uint64
 }
 
 type ResponseError struct {
@@ -734,6 +765,7 @@ func newGateway(client *Client, authenticate ldapAuthenticator) *Gateway {
 		sessions: &sessionStore{
 			sessions: make(map[string]sessionData),
 		},
+		ingestAuthCache: newIngestAuthCache(),
 	}
 }
 
@@ -1083,7 +1115,19 @@ func (g *Gateway) ingestAccess(r *http.Request) ([]Access, error) {
 			return nil, errIngestAuthRequired
 		}
 
-		_, access, err := g.authenticate(strings.TrimSpace(username), password)
+		username = strings.TrimSpace(username)
+		_, access, _, err := g.ingestAuthCache.Resolve(ingestAuthCacheKey(username, password), func() (string, []Access, error) {
+			user, access, err := g.authenticate(username, password)
+			if err != nil {
+				return "", nil, err
+			}
+
+			cachedUsername := username
+			if user != nil && strings.TrimSpace(user.Name) != "" {
+				cachedUsername = strings.TrimSpace(user.Name)
+			}
+			return cachedUsername, access, nil
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -1791,6 +1835,16 @@ func accessGroupNames(access []Access) []string {
 	return groups
 }
 
+func cloneAccess(access []Access) []Access {
+	if len(access) == 0 {
+		return nil
+	}
+
+	cloned := make([]Access, len(access))
+	copy(cloned, access)
+	return cloned
+}
+
 func roleModeForAccess(access Access) string {
 	switch {
 	case !access.PullOnly && access.DeleteAllowed:
@@ -1878,6 +1932,104 @@ func allowedActionsForAccess(mode string) []string {
 	default:
 		return []string{"read"}
 	}
+}
+
+func newIngestAuthCache() *ingestAuthCache {
+	return &ingestAuthCache{
+		now: func() time.Time {
+			return time.Now()
+		},
+		entries:  make(map[string]ingestAuthCacheEntry),
+		inflight: make(map[string]*ingestAuthCacheCall),
+	}
+}
+
+func ingestAuthCacheKey(username, password string) string {
+	sum := sha256.Sum256([]byte(username + ":" + password))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func (c *ingestAuthCache) Resolve(key string, fetch func() (string, []Access, error)) (string, []Access, bool, error) {
+	if c == nil {
+		username, access, err := fetch()
+		return username, cloneAccess(access), false, err
+	}
+
+	c.mu.Lock()
+	now := c.currentTime()
+
+	if entry, ok := c.entries[key]; ok {
+		if !now.After(entry.ExpiresAt) {
+			entry.ExpiresAt = now.Add(ingestAuthCacheTTL)
+			c.entries[key] = entry
+			c.hits++
+			username := entry.Username
+			access := cloneAccess(entry.Access)
+			c.mu.Unlock()
+			return username, access, true, nil
+		}
+
+		delete(c.entries, key)
+		c.expired++
+	}
+
+	if call, ok := c.inflight[key]; ok {
+		c.mu.Unlock()
+		<-call.done
+		if call.err != nil {
+			return "", nil, false, call.err
+		}
+		return call.entry.Username, cloneAccess(call.entry.Access), false, nil
+	}
+
+	call := &ingestAuthCacheCall{done: make(chan struct{})}
+	c.inflight[key] = call
+	c.misses++
+	c.mu.Unlock()
+
+	username, access, err := fetch()
+
+	c.mu.Lock()
+	delete(c.inflight, key)
+	if err == nil {
+		call.entry = ingestAuthCacheEntry{
+			Username:  username,
+			Access:    cloneAccess(access),
+			ExpiresAt: c.currentTime().Add(ingestAuthCacheTTL),
+		}
+		c.entries[key] = call.entry
+	}
+	call.err = err
+	close(call.done)
+	c.mu.Unlock()
+
+	if err != nil {
+		return "", nil, false, err
+	}
+	return username, cloneAccess(access), false, nil
+}
+
+func (c *ingestAuthCache) Stats() ingestAuthCacheStats {
+	if c == nil {
+		return ingestAuthCacheStats{}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return ingestAuthCacheStats{
+		Hits:    c.hits,
+		Misses:  c.misses,
+		Expired: c.expired,
+		Entries: uint64(len(c.entries)),
+	}
+}
+
+func (c *ingestAuthCache) currentTime() time.Time {
+	if c == nil || c.now == nil {
+		return time.Now()
+	}
+	return c.now()
 }
 
 func (s *sessionStore) Create(data sessionData) (string, time.Time, error) {
